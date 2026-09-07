@@ -2,6 +2,7 @@ import { errorCatched } from '../errorHandler.js';
 import { escapeHtml, compressRanges } from '../utils.js';
 import { getSettings } from '../storage.js';
 import { getActiveWorldbookName, isChatWorldbookBound, getAllSummaryEntriesForDisplay, getLastSummarizedFloor } from '../worldbook.js';
+import { getCoverage } from '../worldbook.js';
 /**
  * ui/renderer.js
  * 状态信息与条目列表渲染
@@ -27,6 +28,7 @@ const renderEntryList = (entries, selectionMode = false) => {
         ${escapeHtml(e.name)}
       </span>
       ${statusBadge}
+      ${e.invalid ? '<span class="sa-entry-badge">来源已变化，需重生成</span>' : ''}
       <div class="sa-entry-actions">
         <button class="sa-btn sa-btn-sm" data-action="view-edit" data-name="${escapeHtml(e.name)}">查看/编辑</button>
         <button class="sa-btn sa-btn-sm" data-action="regenerate" data-name="${escapeHtml(e.name)}">重新生成</button>
@@ -52,6 +54,7 @@ const renderMegaEntryList = (entries) => {
         🔷 ${escapeHtml(e.name)}
       </span>
       ${e.disabled ? '<span class="sa-entry-badge sa-entry-badge-disabled" title="条目已关闭">已关闭</span>' : ''}
+      ${e.invalid ? '<span class="sa-entry-badge">来源已变化</span>' : ''}
       <div class="sa-entry-actions">
         <button class="sa-btn sa-btn-sm" data-action="view-edit-mega" data-name="${escapeHtml(e.name)}">查看/编辑</button>
         <button class="sa-btn sa-btn-sm" data-action="regenerate-mega" data-name="${escapeHtml(e.name)}">重新生成</button>
@@ -70,9 +73,10 @@ const renderMegaEntryList = (entries) => {
 const renderStatusInfo = errorCatched(async () => {
   const settings = getSettings();
   const lastId = getLastMessageId();
-  const lastSummarized = await getLastSummarizedFloor();
+  const { floors } = await getCoverage();
   const entries = await getAllSummaryEntriesForDisplay();
-  const unsummarized = lastId - lastSummarized;
+  const all = lastId < 0 ? [] : getChatMessages(`0-${lastId}`, {role:'all',hide_state:'all',include_swipes:false});
+  const unsummarized = all.filter(message=>!floors.has(message.message_id)).length;
   const triggerProgress =
     settings.triggerFloorCount > 0
       ? Math.min(100, Math.round((unsummarized / settings.triggerFloorCount) * 100))
@@ -91,13 +95,15 @@ const renderStatusInfo = errorCatched(async () => {
       ? `(${escapeHtml(settings.customApiModel)})`
       : '';
   return `
+    <div class="sa-metrics"><div class="sa-metric"><strong>${floors.size}</strong><span>已覆盖楼层</span></div><div class="sa-metric"><strong>${unsummarized}</strong><span>未总结消息</span></div><div class="sa-metric"><strong>${entries.length}</strong><span>普通总结记录</span></div></div>
+    <details class="sa-disclosure" data-coverage-details><summary><span>查看覆盖范围与触发条件</span><span class="sa-disclosure-arrow" aria-hidden="true">⌄</span></summary>
     <div class="sa-status-grid">
       <span class="sa-status-label">总楼层数</span>
-      <span class="sa-status-value">${lastId + 1}</span>
+      <span class="sa-status-value">${all.length}（楼层编号从 0 开始）</span>
       <span class="sa-status-label">总结条目数</span>
       <span class="sa-status-value">${entries.length}</span>
-      <span class="sa-status-label">已总结到</span>
-      <span class="sa-status-value">${lastSummarized >= 0 ? `第 ${lastSummarized} 楼` : '尚未总结'}</span>
+      <span class="sa-status-label">有效覆盖楼层</span>
+      <span class="sa-status-value">${escapeHtml(compressRanges([...floors].sort((a,b)=>a-b))) || '尚未总结'}</span>
       <span class="sa-status-label">未总结消息</span>
       <span class="sa-status-value">${unsummarized} 条</span>
       <span class="sa-status-label">触发进度</span>
@@ -112,6 +118,7 @@ const renderStatusInfo = errorCatched(async () => {
       <span class="sa-status-label">当前隐藏楼层</span>
       <span class="sa-status-value" title="${hiddenIds.join(', ')}">${escapeHtml(compressRanges(hiddenIds)) || '无'}</span>
     </div>
+    </details>
   `;
 });
 

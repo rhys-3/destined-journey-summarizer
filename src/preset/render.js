@@ -134,10 +134,13 @@ export function createRender(ctx) {
     if (!status) return;
     for (const button of ctx.shadow.querySelectorAll('button[aria-pressed]')) button.setAttribute('aria-pressed', String(button.classList.contains('selected')));
     for (const toggle of ctx.shadow.querySelectorAll('.switch input')) toggle.parentElement.title = toggle.checked ? '关闭' : '开启';
-    status.className = `status status-${ctx.state.saveState}`;
+    const summaryFeedback = ctx.state.activeTab === 'summary' ? ctx.state.summaryFeedback : null;
+    const kind = summaryFeedback ? (summaryFeedback.kind === 'error' ? 'error' : summaryFeedback.kind === 'success' ? 'saved' : 'idle') : ctx.state.saveState;
+    const message = summaryFeedback?.message ?? ctx.state.saveMessage;
+    status.className = `status status-${kind}`;
     const undo = ctx.state.reorderUndo;
     const canUndo = ctx.state.editorUnlocked && undo && undo.presetName === getLoadedPresetName() && JSON.stringify(undo.order) === JSON.stringify(ctx.state.preset?.prompts?.map(p => p.id));
-    status.innerHTML = `<span class="status-dot"></span><span>${ctx.escapeHtml(ctx.state.saveMessage)}</span>${canUndo ? `<button type="button" class="text-button sort-undo-button" data-action="sort-undo" ${ctx.state.reorderSaving ? 'disabled' : ''}>撤销排序</button>` : ''}`;
+    status.innerHTML = `<span class="status-dot"></span><span>${ctx.escapeHtml(message)}</span>${canUndo ? `<button type="button" class="text-button sort-undo-button" data-action="sort-undo" ${ctx.state.reorderSaving ? 'disabled' : ''}>撤销排序</button>` : ''}`;
   }
 
   function renderPanel() {

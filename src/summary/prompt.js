@@ -1,138 +1,39 @@
-import { errorCatched } from './errorHandler.js';
-import { DEFAULT_MEGA_SUMMARY_PROMPT_BLOCKS } from './config.js';
-import { parseSummaryEntryName } from './utils.js';
 import { getSettings, getMegaSummaryMapping } from './storage.js';
-import { getRawMessages, processMessagesByTags, messagesToMergedText, getRawChatTextForScan } from './messages.js';
-import { getWorldbookEntriesSafe, getAllSummaryContents, getSummaryContentsBefore, getAllMegaSummaryEntriesForDisplay, getMegaSummaryContentsBefore } from './worldbook.js';
-/**
- * prompt.js
- * 总结提示词参数构建
- * 依赖: storage.js, messages.js, worldbook.js, errorHandler.js
- */
+import { getRawMessages, processMessagesByTags, messagesToMergedText } from './messages.js';
+import { getWorldbookEntriesSafe, getSummaryContentsBefore, isEntryDisabled } from './worldbook.js';
+import { sourceOf, sourcesMatch, fingerprint, readArchive, parseRange, consecutiveSummaries, recordValid, currentSources } from './provenance.js';
+import { makeSummaryEntryName } from './utils.js';
 
-const buildSummaryPromptParams = errorCatched(async (startFloor, endFloor) => {
-  const settings = getSettings();
-  const rawMsgs = await getRawMessages(startFloor, endFloor);
-  const processed = processMessagesByTags(rawMsgs, settings.includeTags, settings.excludeTags, settings.excludeHtmlComments);
-  if (processed.length === 0) {
-    throw new Error(`楼层 ${startFloor}-${endFloor} 中没有提取到任何有效内容`);
-  }
-  const mergedChatText = messagesToMergedText(
-    processed,
-    settings.userPrefix,
-    settings.assistantPrefix
-  );
-  let oldSummaryContent = '';
-  if (settings.includeOldSummary) {
-    const allSummaries = await getAllSummaryContents();
-    if (allSummaries.length > 0) {
-      oldSummaryContent = allSummaries
-        .map((s) => `[${s.name}]\n${s.content}`)
-        .join('\n\n');
-    }
-  }
-  const scanText = await getRawChatTextForScan(startFloor, endFloor);
-  return {
-    promptBlocks: settings.promptBlocks || [],
-    oldSummaryContent,
-    mergedChatText,
-    scanText,
-  };
-});
-
-const buildRegeneratePromptParams = errorCatched(async (entryName) => {
-  const settings = getSettings();
-  const parsed = parseSummaryEntryName(entryName);
-  if (!parsed) throw new Error('条目名不符合"总结x-y楼"格式');
-  const { start, end } = parsed;
-  const lastId = getLastMessageId();
-  const actualEnd = Math.min(end, lastId);
-  const rawMsgs = await getRawMessages(start, actualEnd);
-  const processed = processMessagesByTags(rawMsgs, settings.includeTags, settings.excludeTags, settings.excludeHtmlComments);
-  if (processed.length === 0) {
-    throw new Error(`楼层 ${start}-${actualEnd} 中没有提取到任何有效内容`);
-  }
-  const mergedChatText = messagesToMergedText(
-    processed,
-    settings.userPrefix,
-    settings.assistantPrefix
-  );
-  let oldSummaryContent = '';
-  if (settings.includeOldSummary) {
-    const beforeSummaries = await getSummaryContentsBefore(entryName);
-    if (beforeSummaries.length > 0) {
-      oldSummaryContent = beforeSummaries
-        .map((s) => `[${s.name}]\n${s.content}`)
-        .join('\n\n');
-    }
-  }
-  const scanText = await getRawChatTextForScan(start, actualEnd);
-  return {
-    promptBlocks: settings.promptBlocks || [],
-    oldSummaryContent,
-    mergedChatText,
-    scanText,
-  };
-});
-
-const buildMegaSummaryPromptParams = errorCatched(async (summaryNames, entryName = null) => {
-  const settings = getSettings();
-  
-  // 获取所有要大总结的总结条目内容
-  const entries = await getWorldbookEntriesSafe();
-  const summaryContents = [];
-  for (const name of summaryNames) {
-    const entry = entries.find((e) => e && e.name === name);
-    if (entry && entry.content) {
-      summaryContents.push(`[${name}]\n${entry.content}`);
-    }
-  }
-  
-  if (summaryContents.length === 0) {
-    throw new Error('没有找到任何有效的总结条目内容');
-  }
-  
-  const mergedSummaryText = summaryContents.join('\n\n');
-  
-  // 获取已有的大总结内容（如果是重新生成）
-  let oldMegaSummaryContent = '';
-  if (entryName) {
-    const beforeMegaSummaries = await getMegaSummaryContentsBefore(entryName);
-    if (beforeMegaSummaries.length > 0) {
-      oldMegaSummaryContent = beforeMegaSummaries
-        .map((s) => `[${s.name}]\n${s.content}`)
-        .join('\n\n');
-    }
-  } else {
-    // 如果不是重新生成，获取所有已有的大总结
-    const allMegaSummaries = await getAllMegaSummaryEntriesForDisplay();
-    const megaContents = [];
-    for (const mega of allMegaSummaries) {
-      if (mega.disabled) continue;
-      const entry = entries.find((e) => e && e.name === mega.name);
-      if (entry && entry.content) {
-        megaContents.push(`[${mega.name}]\n${entry.content}`);
-      }
-    }
-    if (megaContents.length > 0) {
-      oldMegaSummaryContent = megaContents.join('\n\n');
-    }
-  }
-  
-  return {
-    promptBlocks: settings.megaPromptBlocks || DEFAULT_MEGA_SUMMARY_PROMPT_BLOCKS || [],
-    oldMegaSummaryContent,
-    mergedSummaryText,
-  };
-});
-
-const buildRegenerateMegaSummaryPromptParams = errorCatched(async (entryName) => {
-  const summaryNames = await getMegaSummaryMapping(entryName);
-  if (!summaryNames || summaryNames.length === 0) {
-    throw new Error('未找到该大总结的原始总结条目映射');
-  }
-  
-  return await buildMegaSummaryPromptParams(summaryNames, entryName);
-});
-
-export { buildSummaryPromptParams, buildRegeneratePromptParams, buildMegaSummaryPromptParams, buildRegenerateMegaSummaryPromptParams };
+export async function buildSummaryPromptParams(startFloor, endFloor, settings = getSettings()) {
+  if (!Number.isInteger(startFloor) || !Number.isInteger(endFloor) || startFloor < 0 || endFloor < startFloor) throw new Error('请输入从 0 开始、起点不大于终点的整数楼层范围');
+  if (endFloor > getLastMessageId()) throw new Error('本次来源楼层已删除，请重新选择范围');
+  const raw = await getRawMessages(startFloor, endFloor);
+  const processed = processMessagesByTags(raw, settings.includeTags, settings.excludeTags, settings.excludeHtmlComments);
+  if (!processed.length || !processed.some(message => message.role === 'assistant')) throw new Error('本次范围没有可归档的 AI 正文，请检查提取标签');
+  const included = new Set(processed.map(message => message.id));
+  // An untagged opening has no story material, but is retired with the first
+  // successful batch. Its fingerprint still invalidates that batch if edited.
+  if (raw.some(message => message.id === 0)) included.add(0);
+  const sources = raw.filter(message => included.has(message.id)).map(sourceOf);
+  const history = settings.includeOldSummary ? await getSummaryContentsBefore(makeSummaryEntryName(startFloor, endFloor)) : [];
+  return { kind: 'normal', startFloor, endFloor, promptBlocks: settings.promptBlocks, oldSummaryContent: history.map(entry => '[' + entry.name + ']\n' + entry.content).join('\n\n'), mergedChatText: messagesToMergedText(processed, settings.userPrefix, settings.assistantPrefix), scanText: raw.map(message => message.message).join('\n'), sources, parents: [] };
+}
+export async function buildRegeneratePromptParams(entryName, settings = getSettings()) {
+  const range = parseRange(entryName); if (!range) throw new Error('总结条目名称无效');
+  return buildSummaryPromptParams(range.start, range.end, settings);
+}
+export async function buildMegaSummaryPromptParams(summaryNames, entryName = null, settings = getSettings()) {
+  const ranges = consecutiveSummaries(summaryNames), entries = await getWorldbookEntriesSafe(), archive = readArchive(), current = currentSources();
+  const selected = ranges.map(range => entries.find(entry => entry.name === range.name));
+  if (selected.some(entry => !entry?.content || !recordValid(entry, archive, current, entries) || (!entryName && isEntryDisabled(entry)))) throw new Error('大总结来源已失效、停用或缺失，请先处理普通总结');
+  const startFloor = ranges[0].start, endFloor = ranges.at(-1).end;
+  const sources = [...new Map(selected.flatMap(entry => archive.records[entry.name]?.sources ?? current.filter(source => { const range = parseRange(entry.name); return source.id >= range.start && source.id <= range.end; })).map(source => [source.id, source])).values()];
+  if (!sourcesMatch(sources, current)) throw new Error('大总结的原始楼层已变化');
+  const history = settings.includeOldSummary ? await getSummaryContentsBefore(entryName ?? '总结' + startFloor + '-' + endFloor + '楼') : [];
+  const mergedSummaryText = selected.map(entry => '[' + entry.name + ']\n' + entry.content).join('\n\n');
+  return { kind: 'mega', startFloor, endFloor, promptBlocks: settings.megaPromptBlocks, oldMegaSummaryContent: history.map(entry => '[' + entry.name + ']\n' + entry.content).join('\n\n'), mergedSummaryText, scanText: mergedSummaryText, sources, parents: selected.map(entry => ({ name: entry.name, fingerprint: fingerprint(entry.content) })) };
+}
+export async function buildRegenerateMegaSummaryPromptParams(entryName, settings = getSettings()) {
+  const names = await getMegaSummaryMapping(entryName); if (!names?.length) throw new Error('未找到大总结的原始总结映射');
+  return buildMegaSummaryPromptParams(names, entryName, settings);
+}

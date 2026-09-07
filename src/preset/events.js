@@ -14,7 +14,7 @@ export function createEvents(ctx) {
     const action = target.dataset.action;
     if (ctx.state.workspaceBusy) return;
     if (action === 'entry-edit') { if(ctx.state.editorUnlocked)return ctx.openPromptEditor(target.dataset.id);return; }
-    if (action === 'entry-new-here') {if(!ctx.state.editorUnlocked)return;ctx.openPromptEditor();ctx.setPlacementField('block',target.dataset.block);return;}
+    if (action === 'entry-new-here') {if(!ctx.state.editorUnlocked)return;return ctx.openPromptEditor('',{block:target.dataset.block});}
     if (action === 'entry-copy' || action === 'entry-delete') return ctx.editEntryAction(action).catch(ctx.showErrorToast);
     if (/^(configuration-|model-(add|rename|delete)$)/u.test(action)) return ctx.handleConfigurationAction(action, target).catch(ctx.showErrorToast);
     if (action === 'sort-grip') return;
@@ -132,7 +132,7 @@ export function createEvents(ctx) {
     if (action === 'refresh-profiles') return ctx.loadProfiles();
   }
 
-  function handleChange(event) {
+  async function handleChange(event) {
     const target = event.target;
     const action = target.dataset.action;
     if (action === 'configuration-scope') { const scopes=target.dataset.kind==='save'?ctx.configurationScopes:ctx.exportScopes; scopes[target.dataset.key]=target.checked; return; }
@@ -151,7 +151,7 @@ export function createEvents(ctx) {
       const model = ctx.state.config.custom_models.find(item => item.id === target.dataset.model);
       const tail = model && ctx.getPrompt(ctx.state.preset, model.ids[2]);
       const edited = tail && (tail.content !== model.tailBaseline.content || tail.role !== model.tailBaseline.role);
-      if (edited && !window.confirm('切换类型会替换当前自定义尾部的正文和角色，并保存恢复点。继续？')) { target.value = model.tailMode; return; }
+      if (edited && !await ctx.dialogs.confirm('切换类型会替换当前自定义尾部的正文和角色，并保存恢复点。继续？')) { target.value = model.tailMode; return; }
       ctx.setCustomTail(target.dataset.model, target.value, !!edited).catch(ctx.showErrorToast); return;
     }
     if (action === 'edit-mode') {
@@ -162,6 +162,9 @@ export function createEvents(ctx) {
       ctx.render();return;
     }
     if (action === 'prompt-field') {
+      // Text fields emit change on blur, between pressing and releasing Save.
+      // Preserve the button in that interval so the first click reaches it.
+      if (target.tagName !== 'SELECT' && target.type !== 'checkbox') return handleInput(event);
       ctx.setEditorField(target.dataset.field, target.type === 'checkbox' ? target.checked : target.value);
       return ctx.renderStyleEditorLayer();
     }

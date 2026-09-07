@@ -1,6 +1,7 @@
-import { BLOCK_TYPES } from '../config.js';
-import { escapeHtml, tagsToString } from '../utils.js';
+import { escapeHtml } from '../utils.js';
+import { renderTagEditor } from './tagEditor.js';
 import { getActiveWorldbookName, isChatWorldbookBound } from '../worldbook.js';
+import { renderVisibilityPanel } from './visibilityView.js';
 /**
  * ui/panel.js
  * 设置面板 UI、HTML 构建、事件绑定
@@ -12,111 +13,14 @@ import { getActiveWorldbookName, isChatWorldbookBound } from '../worldbook.js';
 
 // ---- 辅助渲染函数 ----
 
-const buildRoleSelect = (id, selected) => {
-  const roles = ["system", "user", "assistant"];
-  const options = roles
-    .map(
-      (r) =>
-        `<option value="${r}" ${r === selected ? "selected" : ""}>${r}</option>`,
-    )
-    .join("");
-  return `<select class="sa-select" id="${id}" style="max-width:140px">${options}</select>`;
-};
-
-const getBlockTypeName = (type) => {
-  switch (type) {
-    case BLOCK_TYPES.PROMPT:
-      return "提示词";
-    case BLOCK_TYPES.BUILTIN_GROUP:
-      return "内置";
-    case BLOCK_TYPES.OLD_SUMMARY:
-      return "总结";
-    case BLOCK_TYPES.CHAT_MESSAGES:
-      return "消息";
-    default:
-      return type;
-  }
-};
-
-const BUILTIN_BLOCK_IDS = [
-  "jailbreak",
-  "summary_rules",
-  "summary_instruction",
-  "mega_jailbreak",
-  "mega_summary_rules",
-  "mega_summary_instruction",
-];
-
-const renderBlock = (block, index, total) => {
-  const isPrompt = block.type === BLOCK_TYPES.PROMPT;
-  const isBuiltin = block.type === BLOCK_TYPES.BUILTIN_GROUP;
-  const isChatMessages = block.type === BLOCK_TYPES.CHAT_MESSAGES;
-  const hasRole = !isBuiltin;
-  const hasContent = isPrompt;
-  const isCustom = isPrompt && !BUILTIN_BLOCK_IDS.includes(block.id);
-  const hasLeadText = isChatMessages;
-  return `
-    <div class="sa-block ${block.enabled ? "" : "sa-block-disabled"}" data-block-id="${escapeHtml(block.id)}" draggable="true">
-      <div class="sa-block-header collapsed" data-block-toggle="${escapeHtml(block.id)}">
-        <span class="sa-block-drag" title="拖拽排序">⠿</span>
-        <label class="sa-block-enable">
-          <input type="checkbox" data-block-enable="${escapeHtml(block.id)}" ${block.enabled ? "checked" : ""}>
-        </label>
-        <span class="sa-block-name">${escapeHtml(block.name)}</span>
-        <span class="sa-block-type-badge">${getBlockTypeName(block.type)}</span>
-        ${isCustom ? `<button class="sa-block-delete-btn" data-block-delete="${escapeHtml(block.id)}" title="删除板块">✕</button>` : ""}
-        <span class="sa-block-chevron">▼</span>
-      </div>
-      <div class="sa-block-body collapsed" data-block-body="${escapeHtml(block.id)}">
-        ${
-          hasRole
-            ? `
-          <div class="sa-block-role-row">
-            <span class="sa-block-role-label">Role</span>
-            ${buildRoleSelect(`sa-block-role-${block.id}`, block.role || "system")}
-          </div>
-        `
-            : ""
-        }
-        ${
-          hasContent
-            ? `
-          <textarea class="sa-textarea ${block.content && block.content.length > 200 ? "sa-textarea-tall" : ""}"
-            data-block-content="${escapeHtml(block.id)}"
-            style="min-height:${block.content && block.content.length > 500 ? "200px" : "80px"}"
-          >${escapeHtml(block.content || "")}</textarea>
-        `
-            : ""
-        }
-        ${
-          hasLeadText
-            ? `
-          <div class="sa-block-role-row" style="margin-top:6px">
-            <span class="sa-block-role-label">引导语</span>
-            <input class="sa-input" data-block-lead-text="${escapeHtml(block.id)}" type="text"
-              value="${escapeHtml(block.leadText || "")}" placeholder="发送内容前的引导文字">
-          </div>
-          <div class="sa-hint">运行时自动填充内容。引导语会添加在内容前面。可设置发送时的 role。</div>
-        `
-            : ""
-        }
-        ${
-          isBuiltin
-            ? `
-          <div class="sa-hint">包含：world_info_before, persona_description, char_description, char_personality, scenario, world_info_after, dialogue_examples</div>
-        `
-            : ""
-        }
-        ${
-          block.type === BLOCK_TYPES.OLD_SUMMARY
-            ? `
-          <div class="sa-hint">运行时自动填充已有总结内容。可设置发送时的 role。</div>
-        `
-            : ""
-        }
-      </div>
-    </div>
-  `;
+export function editablePromptBlock(block) {
+  if(block.content!==undefined)return {...block,type:'prompt'};
+  const content=block.type==='builtin_group'?['world_before','persona','character','personality','scenario','world_after','examples'].map(name=>'{{summary.'+name+'}}').join('\n\n'):block.type==='old_summary'?'<prior_memory>\n{{summary.history}}\n</prior_memory>':(block.leadText??'')+'\n<'+(block.xmlTag||'source_material')+'>\n{{summary.material}}\n</'+(block.xmlTag||'source_material')+'>';
+  return {...block,type:'prompt',role:block.role||'user',content};
+}
+const renderBlock = raw => {
+  const block=editablePromptBlock(raw),id=escapeHtml(block.id);
+  return '<div class="sa-block sa-prompt-entry '+(block.enabled?'':'sa-block-disabled')+'" data-block-id="'+id+'" data-block="'+escapeHtml(JSON.stringify(block))+'" draggable="true"><div class="sa-block-header"><span class="sa-block-drag" title="拖动排序；也可用 Alt 加方向键" role="button" tabindex="0" aria-label="拖动 '+escapeHtml(block.name)+'">⠿</span><button type="button" class="sa-block-name" data-block-edit="'+id+'">'+escapeHtml(block.name)+'</button><span class="sa-role-badge">'+escapeHtml(block.role||'system')+'</span><label class="sa-block-enable" title="启用 '+escapeHtml(block.name)+'"><input type="checkbox" role="switch" aria-label="启用 '+escapeHtml(block.name)+'" data-block-enable="'+id+'" '+(block.enabled?'checked':'')+'></label></div></div>';
 };
 
 const renderBlocks = (blocks, containerId = "sa-blocks-container") => {
@@ -141,20 +45,24 @@ const renderBlocks = (blocks, containerId = "sa-blocks-container") => {
 
 const buildPanelHtml = (settings) => `
 <div class="sa-panel">
-  <article class="card"><label class="sa-enable"><input type="checkbox" id="sa-enabled" ${settings.enabled ? 'checked' : ''}>启用总结功能</label><p>达到阈值后自动总结；关闭保留已有记录。</p></article>
+  <div class="sa-workspace-heading"><div><h3>剧情档案</h3><p class="sa-hint">整理剧情、管理记忆与生成规则</p></div><label class="sa-enable"><input type="checkbox" id="sa-enabled" ${settings.enabled ? 'checked' : ''}>自动总结</label></div>
+  <div class="sa-generation-actions"><button class="sa-btn sa-btn-primary" id="sa-start-summary">手动开始总结</button><button class="sa-btn" id="sa-start-custom-summary">指定楼层总结</button><span class="sa-hint">自动开关只控制后续自动任务。</span></div>
+  <p class="sa-hint sa-binding-hint" data-binding-hint></p>
+  <p id="sa-busy-reason" class="sa-task-reason" hidden></p>
   <div class="sa-tabs">
-    <button class="sa-tab-item active" data-tab="status">记录</button>
-    <button class="sa-tab-item" data-tab="settings">参数</button>
+    <button class="sa-tab-item active" data-tab="status">记录与任务</button>
+    <button class="sa-tab-item" data-tab="settings">生成设置</button>
     <button class="sa-tab-item" data-tab="prompts">提示词</button>
-  </div>
-  <div class="sa-status-bar" style="padding:10px 16px;border-bottom:1px solid var(--sa-border);background:var(--sa-bg);flex-shrink:0;">
-    <div id="sa-status-info" class="sa-status">加载中...</div>
+    <button class="sa-tab-item" data-tab="worldbook">世界书</button>
   </div>
   <div class="sa-body">
     <div class="sa-tab-pane active" data-pane="status">
+      <div class="sa-task-widget" data-task-widget hidden></div>
+      ${renderVisibilityPanel(settings)}
+      <div class="sa-status-bar"><div id="sa-status-info" class="sa-status">加载中...</div></div>
       <div class="sa-section">
         <div class="sa-section-header">
-          <span>📚 总结条目列表</span>
+          <span>普通总结</span>
           <button class="sa-btn sa-btn-sm sa-btn-primary" id="sa-start-mega-summary" style="margin-left:auto">开始大总结</button>
         </div>
         <div class="sa-section-body">
@@ -162,7 +70,7 @@ const buildPanelHtml = (settings) => `
         </div>
       </div>
       <div class="sa-section" style="margin-top:16px">
-        <div class="sa-section-header"><span>🔷 大总结条目列表</span></div>
+        <div class="sa-section-header"><span>大总结</span></div>
         <div class="sa-section-body">
           <div id="sa-mega-entry-list" class="sa-entry-list"><div class="sa-empty">加载中...</div></div>
         </div>
@@ -171,28 +79,37 @@ const buildPanelHtml = (settings) => `
     <div class="sa-tab-pane" data-pane="settings">
       <div class="sa-settings-layout">
         <div class="sa-settings-nav">
-          <a class="sa-settings-nav-item active" data-sub-nav="core"><span>核心总结</span></a>
-          <a class="sa-settings-nav-item" data-sub-nav="api"><span>API & 模型</span></a>
-          <a class="sa-settings-nav-item" data-sub-nav="worldbook"><span>世界书</span></a>
-          <a class="sa-settings-nav-item" data-sub-nav="tags"><span>标签过滤</span></a>
-          <a class="sa-settings-nav-item" data-sub-nav="visibility"><span>楼层显隐</span></a>
+          <button class="sa-settings-nav-item active" data-sub-nav="core">自动与批次</button>
+          <button class="sa-settings-nav-item" data-sub-nav="api">连接与模型</button>
+          <button class="sa-settings-nav-item" data-sub-nav="tags">读取正文</button>
         </div>
         <div class="sa-settings-content">
           <div class="sa-settings-pane active" data-sub-pane="core">
+            <h4 class="sa-group-title">普通总结</h4>
+            <label class="sa-field">批次方案（触发 / 保留）<select class="sa-select" id="sa-batch-preset"><option value="with-summary" ${settings.batchPreset==='with-summary'?'selected':''}>已开启摘要 · 推荐 50 / 10</option><option value="without-summary" ${settings.batchPreset==='without-summary'?'selected':''}>未开启摘要 · 推荐 20 / 5</option><option value="custom" ${settings.batchPreset==='custom'?'selected':''}>自定义</option></select></label>
+            <p class="sa-hint">请按自己的摘要使用情况选择。这里不会读取或修改摘要开关；修改触发数或保留数会切换为自定义。</p>
             <div class="sa-row sa-row-pair">
-              <div class="sa-pair-item"><span class="sa-label">触发楼层数</span><input class="sa-input" id="sa-trigger-count" type="number" min="10" max="999" value="${settings.triggerFloorCount}"></div>
+              <div class="sa-pair-item"><span class="sa-label">触发楼层数</span><input class="sa-input" id="sa-trigger-count" type="number" min="1" max="999" value="${settings.triggerFloorCount}"></div>
               <div class="sa-pair-item"><span class="sa-label">保留楼层数</span><input class="sa-input" id="sa-keep-count" type="number" min="1" max="999" value="${settings.keepFloorCount}"></div>
             </div>
-            <div class="sa-hint">每累积"触发楼层数"条未总结消息时触发总结，保留最近"保留楼层数"条不参与总结。</div>
+            <div class="sa-row sa-row-pair"><div class="sa-pair-item"><span class="sa-label">每批最多楼层</span><input class="sa-input" id="sa-batch-count" type="number" min="1" max="999" value="${settings.batchFloorCount}"></div></div>
+            <p class="sa-hint">每批上限用来控制单次请求的材料量，避免一次发送过多 Tokens。达到触发数后，会完成本轮可总结范围。</p>
+            <div class="sa-row"><label class="sa-enable"><input type="checkbox" id="sa-parallel-batches" ${settings.parallelBatches?'checked':''}>并发生成批次</label><label class="sa-concurrency-field">并发数<input class="sa-input" id="sa-batch-concurrency" type="number" min="1" max="8" value="${settings.batchConcurrency}" ${settings.parallelBatches?'':'disabled'}></label></div>
+            <p class="sa-batch-explanation" data-batch-explanation role="status"></p>
+            <p class="sa-hint" data-batch-history-hint ${settings.parallelBatches?'':'hidden'}>同一组并发批次使用生成前已有的总结，不包含彼此刚生成的结果。需要逐批参考前一批结果时，请关闭并发。</p>
+            <h4 class="sa-group-title">大总结</h4>
+            <label class="sa-enable"><input type="checkbox" id="sa-auto-mega" ${settings.autoMegaSummary?'checked':''}>自动合并连续普通总结</label>
+            <div class="sa-row sa-row-pair"><div class="sa-pair-item"><span class="sa-label">普通总结累计（条）</span><input class="sa-input" id="sa-mega-trigger" type="number" min="3" max="999" value="${settings.megaTriggerCount}"></div><div class="sa-pair-item"><span class="sa-label">合并最早连续（条）</span><input class="sa-input" id="sa-mega-batch" type="number" min="2" max="998" value="${settings.megaBatchCount}"></div></div>
+            <p class="sa-hint">两项均可修改。默认累计 15 条时合并最早 10 条，保留最近 5 条普通总结。</p>
+            <h4 class="sa-group-title">记忆与保存</h4>
             <div class="sa-checkbox-grid">
               <label><input type="checkbox" id="sa-include-old-summary" ${settings.includeOldSummary ? "checked" : ""}> 发送已有总结</label>
-              <label><input type="checkbox" id="sa-auto-confirm" ${settings.autoTriggerConfirm ? "checked" : ""}> 自动触发时确认</label>
-              <label><input type="checkbox" id="sa-auto-hide-summarized" ${settings.autoHideSummarizedFloors !== false ? "checked" : ""}> 自动隐藏楼层</label>
-              <label class="sa-no-trans-label"><input type="checkbox" id="sa-no-trans-tag" ${settings.noTransTag !== false ? "checked" : ""}> SPreset 防合并标记<input class="sa-input sa-no-trans-input" id="sa-no-trans-tag-value" type="text" placeholder="<|no-trans|>" value="${escapeHtml(settings.noTransTagValue || "<|no-trans|>")}" title="自定义防合并标记"></label>
+              <input type="checkbox" id="sa-auto-confirm" hidden ${settings.autoTriggerConfirm ? "checked" : ""}>
             </div>
+            <h4 class="sa-group-title">材料前缀</h4>
             <div class="sa-row" style="margin-top:12px"><span class="sa-label">用户前缀</span><input class="sa-input" id="sa-user-prefix" type="text" placeholder="{{user}}" value="${escapeHtml(settings.userPrefix || "{{user}}")}"></div>
-            <div class="sa-row"><span class="sa-label">AI前缀</span><input class="sa-input" id="sa-assistant-prefix" type="text" placeholder="{{char}}" value="${escapeHtml(settings.assistantPrefix || "{{char}}")}"></div>
-            <div class="sa-hint">每条消息前的发言者标识。支持酒馆宏 {{user}}、{{char}}。</div>
+            <div class="sa-row"><span class="sa-label">AI前缀</span><input class="sa-input" id="sa-assistant-prefix" type="text" placeholder="AI" value="${escapeHtml(settings.assistantPrefix ?? 'AI')}"></div>
+            <div class="sa-hint">前缀用于标注发给总结模型的楼层材料。用户默认 {{user}}，AI 默认 AI；可按自定义总结预设修改，支持 {{user}}、{{char}} 名称宏。</div>
           </div>
           <div class="sa-settings-pane" data-sub-pane="api">
             <div class="sa-row"><span class="sa-label">API 模式</span>
@@ -205,75 +122,66 @@ const buildPanelHtml = (settings) => `
               <div class="sa-row"><span class="sa-label">API 地址</span><input class="sa-input" id="sa-api-url" type="text" placeholder="https://api.example.com/v1" value="${escapeHtml(settings.customApiUrl)}"></div>
               <div class="sa-row"><span class="sa-label">API 密钥</span><input class="sa-input" id="sa-api-key" type="password" placeholder="sk-..." value="${escapeHtml(settings.customApiKey)}"></div>
               <div class="sa-row"><span class="sa-label">模型</span><select class="sa-select" id="sa-api-model" style="flex:1">${settings.customApiModel ? `<option value="${escapeHtml(settings.customApiModel)}" selected>${escapeHtml(settings.customApiModel)}</option>` : '<option value="">请先获取模型列表</option>'}</select><button class="sa-btn sa-btn-sm" id="sa-fetch-models">获取列表</button></div>
+              <div class="sa-row"><span class="sa-label">手动填写模型</span><input class="sa-input" id="sa-api-model-manual" value="${escapeHtml(settings.customApiModel)}" placeholder="模型名称"></div>
             </div>
+            <div class="sa-hint">跟随当前连接，或为总结单独指定数值。两种连接模式均有效，修改将在下次任务生效。</div>
             <div class="sa-row sa-row-pair" style="margin-top:12px">
-              <div class="sa-pair-item"><span class="sa-label">温度</span><input class="sa-input" id="sa-temperature" type="text" placeholder="same_as_preset" value="${settings.temperature}"></div>
-              <div class="sa-pair-item"><span class="sa-label">最大Tokens</span><input class="sa-input" id="sa-max-tokens" type="text" placeholder="same_as_preset" value="${settings.maxTokens}"></div>
-            </div>
-          </div>
-          <div class="sa-settings-pane" data-sub-pane="worldbook">
-            <div class="sa-row"><span class="sa-label">绑定状态</span><span class="sa-status-value" id="sa-wb-bind-status">${isChatWorldbookBound() ? `✅ 已绑定: ${escapeHtml(getActiveWorldbookName())}` : "❌ 未绑定"}</span></div>
-            <div class="sa-hint">总结条目将写入绑定的世界书。</div>
-            <div class="sa-row" style="margin-top:12px"><span class="sa-label">选择已有</span><select class="sa-select" id="sa-wb-select" style="flex:1"><option value="">-- 加载中 --</option></select></div>
-            <div class="sa-row"><span class="sa-label">或新建</span><input class="sa-input" id="sa-new-wb-name" type="text" placeholder="输入新的世界书名称（留空则自动生成）"></div>
-            <div class="sa-btn-group" style="margin-top:8px">
-              <button class="sa-btn sa-btn-sm sa-btn-primary" id="sa-bind-worldbook">绑定世界书</button>
-              <button class="sa-btn sa-btn-sm" id="sa-switch-worldbook" ${!isChatWorldbookBound() ? "disabled" : ""}>迁移</button>
-              <button class="sa-btn sa-btn-sm sa-btn-danger" id="sa-unbind-worldbook" ${!isChatWorldbookBound() ? "disabled" : ""}>解绑</button>
+              <div class="sa-pair-item"><span class="sa-label">温度</span><select class="sa-select" id="sa-temperature-mode"><option value="follow" ${settings.temperature==='same_as_preset'?'selected':''}>跟随连接</option><option value="override" ${settings.temperature!=='same_as_preset'?'selected':''}>指定数值</option></select><input class="sa-input" id="sa-temperature" type="number" min="0" step="0.1" aria-label="总结温度" value="${settings.temperature==='same_as_preset'?1:settings.temperature}" ${settings.temperature==='same_as_preset'?'disabled':''}></div>
+              <div class="sa-pair-item"><span class="sa-label">最大 Tokens</span><select class="sa-select" id="sa-max-tokens-mode"><option value="follow" ${settings.maxTokens==='same_as_preset'?'selected':''}>跟随连接</option><option value="override" ${settings.maxTokens!=='same_as_preset'?'selected':''}>指定数值</option></select><input class="sa-input" id="sa-max-tokens" type="number" min="1" aria-label="总结最大 Tokens" value="${settings.maxTokens==='same_as_preset'?32000:settings.maxTokens}" ${settings.maxTokens==='same_as_preset'?'disabled':''}></div>
             </div>
           </div>
            <div class="sa-settings-pane" data-sub-pane="tags">
-            <div class="sa-row"><span class="sa-label">提取标签</span><input class="sa-input" id="sa-include-tags" type="text" placeholder="tp, gametxt" value="${escapeHtml(tagsToString(settings.includeTags))}"></div>
-            <div class="sa-hint">只提取这些标签内的内容发给AI。多个标签用逗号分隔。留空则发送完整消息。</div>
-            <div class="sa-row" style="margin-top:12px"><span class="sa-label">排除标签</span><input class="sa-input" id="sa-exclude-tags" type="text" placeholder="think, hidden" value="${escapeHtml(tagsToString(settings.excludeTags))}"></div>
-            <div class="sa-hint">排除这些标签内的内容。在提取之前执行。</div>
+            ${renderTagEditor('includeTags','提取标签',settings.includeTags)}
+            <div class="sa-hint">AI 回复只读取这些标签内的正文；用户输入保留全文。未添加任何标签时读取完整 AI 回复。</div>
+            ${renderTagEditor('excludeTags','排除标签',settings.excludeTags)}
+            <div class="sa-hint">从已经提取的 AI 正文中移除这些标签及其内容，默认留空。</div>
             <div class="sa-row" style="margin-top:12px">
               <label><input type="checkbox" id="sa-exclude-html-comments" ${settings.excludeHtmlComments !== false ? "checked" : ""}> 隐藏HTML注释 (&lt;!-- ... --&gt;)</label>
             </div>
             <div class="sa-hint">隐藏消息中被 &lt;!-- 和 --&gt; 包裹的内容。</div>
           </div>
-          <div class="sa-settings-pane" data-sub-pane="visibility">
-            <div class="sa-row sa-row-pair">
-              <div class="sa-pair-item"><span class="sa-label">起始楼层</span><input class="sa-input" id="sa-vis-from" type="number" min="0" placeholder="0" value="0"></div>
-              <div class="sa-pair-item"><span class="sa-label">结束楼层</span><input class="sa-input" id="sa-vis-to" type="number" min="0" placeholder="0" value=""></div>
-            </div>
-            <div class="sa-btn-group" style="margin-top:8px">
-              <button class="sa-btn sa-btn-sm" id="sa-vis-hide-range">隐藏范围</button>
-              <button class="sa-btn sa-btn-sm" id="sa-vis-show-range">显示范围</button>
-            </div>
-            <div class="sa-btn-group" style="margin-top:10px">
-              <button class="sa-btn sa-btn-sm sa-btn-primary" id="sa-vis-hide-summarized">一键隐藏已总结</button>
-              <button class="sa-btn sa-btn-sm" id="sa-vis-show-all">一键显示全部</button>
-            </div>
-          </div>
         </div>
       </div>
     </div>
+    <div class="sa-tab-pane" data-pane="worldbook">
+      <section class="sa-section"><div class="sa-section-header">本聊天的总结世界书</div><div class="sa-section-body">
+        <div class="sa-bound-book" id="sa-wb-bind-status">${isChatWorldbookBound() ? `已绑定：${escapeHtml(getActiveWorldbookName())}` : '尚未绑定'}</div>
+        <p class="sa-hint">首次总结时，如未绑定世界书，会自动创建并绑定本聊天的独立总结书。也可手动选择酒馆已有的世界书；主动解绑后会暂停自动建书。</p>
+        <div class="sa-btn-group"><button class="sa-btn" id="sa-view-worldbook">查看记忆</button><button class="sa-btn" id="sa-unbind-worldbook">解绑</button><button class="sa-btn sa-btn-danger" id="sa-delete-worldbook">删除总结书</button></div>
+      </div></section>
+      <section class="sa-section"><div class="sa-section-header">选择绑定其他世界书</div><div class="sa-section-body">
+        <label class="sa-field">酒馆全部世界书<select class="sa-select" id="sa-wb-select"><option value="">加载中…</option></select></label>
+        <button class="sa-btn sa-btn-sm" id="sa-refresh-worldbooks">刷新列表</button>
+        <label class="sa-field">或新建世界书<input class="sa-input" id="sa-new-wb-name" type="text" placeholder="输入新名称；不选已有书且留空则自动命名"></label>
+        <div class="sa-btn-group"><button class="sa-btn sa-btn-primary" id="sa-bind-worldbook">绑定世界书</button><button class="sa-btn" id="sa-switch-worldbook">迁移</button></div>
+        <p class="sa-hint">“绑定”更换后续保存位置；“迁移”同时搬移当前总结记录。已有书的其他条目会保留。</p>
+      </div></section>
+    </div>
     <div class="sa-tab-pane" data-pane="prompts">
-      <div class="sa-section">
-        <div class="sa-section-header"><span>📝 总结提示词板块（可排序）</span></div>
+      <p class="sa-next-task-note">提示词及连接修改在下次任务生效。只保存 &lt;summary_result&gt; 内的最终正文。</p>
+      <nav class="sa-prompt-nav" aria-label="提示词分类"><button class="active" data-prompt-page="normal">普通总结</button><button data-prompt-page="mega">大总结</button></nav>
+      <div class="sa-prompt-page active" data-prompt-pane="normal">
+        <div class="sa-prompt-toolbar"><span class="sa-hint">按顺序发送；点击条目编辑正文与角色。</span><button class="sa-btn" data-prompt-preview="normal">查看实际请求</button></div>
+        <div class="sa-section-header"><span>普通总结提示词</span></div>
         <div class="sa-section-body">
-            <div class="sa-hint" style="margin-bottom:10px">拖拽板块调整顺序。板块按从上到下的顺序发送给AI。</div>
             <div id="sa-blocks-container" class="sa-blocks-container">${renderBlocks(settings.promptBlocks || [], "sa-blocks-container")}</div>
         </div>
       </div>
-      <div class="sa-section" style="margin-top:16px">
-        <div class="sa-section-header"><span>🔷 大总结提示词板块（可排序）</span></div>
+      <div class="sa-prompt-page" data-prompt-pane="mega">
+        <div class="sa-prompt-toolbar"><span class="sa-hint">整合连续普通总结；可单独编辑与排序。</span><button class="sa-btn" data-prompt-preview="mega">查看实际请求</button></div>
+        <div class="sa-section-header"><span>大总结提示词</span></div>
         <div class="sa-section-body">
-            <div class="sa-hint" style="margin-bottom:10px">拖拽板块调整顺序。大总结时按从上到下的顺序发送给AI。</div>
             <div id="sa-mega-blocks-container" class="sa-blocks-container">${renderBlocks(settings.megaPromptBlocks || [], "sa-mega-blocks-container")}</div>
         </div>
       </div>
+      <div class="sa-prompt-library"><span class="sa-hint">右侧开关，拖动排序，点击条目弹窗编辑。</span><div class="sa-btn-group"><button class="sa-btn" data-edit-macros>自定义变量</button><button class="sa-btn" data-prompts-export>导出提示词</button><button class="sa-btn" data-prompts-import>导入提示词</button><input type="file" accept=".json,application/json" data-prompts-file hidden></div></div>
     </div>
   </div>
   <div class="sa-footer">
     <div class="sa-footer-left"><button class="sa-btn sa-btn-danger" id="sa-reset">重置总结参数</button></div>
-    <div class="sa-footer-right">
-      <button class="sa-btn" id="sa-start-custom-summary">指定楼层总结</button>
-      <button class="sa-btn sa-btn-primary" id="sa-start-summary">手动开始总结</button>
-    </div>
+    <span class="sa-hint">修改自动保存，结果显示在助手左下角。</span>
   </div>
 </div>
 `;
 
-export { buildRoleSelect, getBlockTypeName, BUILTIN_BLOCK_IDS, renderBlock, renderBlocks, buildPanelHtml };
+export { renderBlock, renderBlocks, buildPanelHtml };

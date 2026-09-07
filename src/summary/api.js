@@ -1,15 +1,8 @@
 import { requestGeneration } from '../platform/lifecycle.js';
-import { extractHttpStatus, errorCatched } from './errorHandler.js';
-import { BLOCK_TYPES, BUILTIN_PROMPTS } from './config.js';
+import { extractHttpStatus, errorCatched, safeErrorDetails } from './errorHandler.js';
 import { getSettings } from './storage.js';
-import { replaceMacros } from './messages.js';
-import { assertCurrent } from '../platform/lifecycle.js';
-/**
- * api.js
- * API 调用逻辑（酒馆主API / 自定义API）
- * 依赖: config.js, storage.js, messages.js, errorHandler.js
- */
-
+import { compilePrompt, generationApi } from './macros.js';
+import { tavernContext } from '../platform/ambient.js';
 const parseOptionalNumberSetting = (value, fieldLabel) => {
   if (value === undefined || value === null) return undefined;
   if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
@@ -28,190 +21,51 @@ const parseOptionalNumberSetting = (value, fieldLabel) => {
 };
 
 const buildCustomApiConfig = (settings) => {
-  if (settings.apiMode !== 'custom') return undefined;
-  if (!settings.customApiUrl || !settings.customApiModel) {
+
+  if (settings.apiMode === 'custom' && (!settings.customApiUrl || !settings.customApiModel)) {
     throw new Error('自定义API模式下必须填写API地址和模型名称');
   }
-  const config = {
-    apiurl: settings.customApiUrl,
-    model: settings.customApiModel,
-    source: settings.customApiSource || 'openai',
-  };
+  const config = settings.apiMode === 'custom' ? { apiurl: settings.customApiUrl, model: settings.customApiModel, source: settings.customApiSource || 'openai' } : {};
   const temperature = parseOptionalNumberSetting(settings.temperature, '温度');
   const maxTokens = parseOptionalNumberSetting(settings.maxTokens, '最大Tokens');
-  if (settings.customApiKey) config.key = settings.customApiKey;
+  if (settings.apiMode === 'custom' && settings.customApiKey) config.key = settings.customApiKey;
   if (temperature !== undefined) config.temperature = temperature;
   if (maxTokens !== undefined) config.max_tokens = maxTokens;
-  return config;
+  return Object.keys(config).length ? config : undefined;
 };
 
-const callSummaryApi = errorCatched(
-  async ({ promptBlocks, oldSummaryContent, mergedChatText, scanText }) => {
-    const settings = getSettings();
-    const customApi = buildCustomApiConfig(settings);
-    const useNoTrans = settings.noTransTag !== false;
-    const NO_TRANS = settings.noTransTagValue || '<|no-trans|>';
-    const wrapContent = (text) => (useNoTrans ? `${NO_TRANS}${text}` : text);
-
-    const orderedPrompts = [];
-    for (const block of promptBlocks) {
-      if (!block.enabled) continue;
-      switch (block.type) {
-        case BLOCK_TYPES.PROMPT: {
-          const content = replaceMacros(block.content || '');
-          if (content.trim()) {
-            orderedPrompts.push({
-              role: block.role || 'system',
-              content: wrapContent(content),
-            });
-          }
-          break;
-        }
-        case BLOCK_TYPES.BUILTIN_GROUP: {
-          orderedPrompts.push(...BUILTIN_PROMPTS);
-          break;
-        }
-        case BLOCK_TYPES.OLD_SUMMARY: {
-          if (oldSummaryContent && oldSummaryContent.trim()) {
-            orderedPrompts.push({
-              role: block.role || 'system',
-              content: wrapContent(
-                `<existing_summary>\n${oldSummaryContent}\n</existing_summary>`
-              ),
-            });
-          }
-          break;
-        }
-        case BLOCK_TYPES.CHAT_MESSAGES: {
-          if (mergedChatText && mergedChatText.trim()) {
-            const lead = block.leadText || '以下是本次需要总结的聊天内容：';
-            const xmlTag = block.xmlTag || 'chat_content';
-            orderedPrompts.push({
-              role: block.role || 'user',
-              content: wrapContent(
-                `${lead}\n<${xmlTag}>\n${mergedChatText}\n</${xmlTag}>`
-              ),
-            });
-          }
-          break;
-        }
-      }
+export async function prepareGeneration(params, settings = getSettings()) {
+  const compiled = await compilePrompt(params, settings);
+  const config = { should_silence: true, ordered_prompts: compiled.orderedPrompts, max_chat_history: 0, overrides: { chat_history: { prompts: [], with_depth_entries: false }, world_info_before: '', world_info_after: '', persona_description: '', char_description: '', char_personality: '', scenario: '', dialogue_examples: '' } };
+  const custom = { ...buildCustomApiConfig(settings) };
+  const st=tavernContext(), context=st?.getContext?.()??{}, active=st?.chatCompletionSettings??context.chatCompletionSettings;
+  if(active){
+    if(settings.temperature==='same_as_preset'&&Number.isFinite(active.temp_openai))custom.temperature=active.temp_openai;
+    if(settings.maxTokens==='same_as_preset'&&Number.isInteger(active.openai_max_tokens))custom.max_tokens=active.openai_max_tokens;
+    if(settings.apiMode==='tavern'){
+      if(active.chat_completion_source)custom.source=active.chat_completion_source;
+      const model=(st?.getChatCompletionModel??context.getChatCompletionModel)?.(active.chat_completion_source);if(model)custom.model=model;
     }
-
-    const injects = [];
-    if (scanText && scanText.trim()) {
-      injects.push({
-        role: 'system',
-        content: scanText,
-        position: 'none',
-        should_scan: true,
-      });
-    }
-
-    const config = { should_silence: true, ordered_prompts: orderedPrompts, injects };
-    if (customApi) config.custom_api = customApi;
-
-    let generateRawFn =
-      (typeof generateRaw !== 'undefined' ? generateRaw : undefined) ||
-      (typeof window !== 'undefined'
-        ? window.generateRaw || (window.parent && window.parent.generateRaw)
-        : undefined);
-
-    if (generateRawFn) {
-      try {
-        const result = await requestGeneration(generateRawFn, config);
-        assertCurrent();
-        return result ? String(result).trim() : '';
-      } catch (e) {
-        if (e.name === "AbortError") throw e;
-        const status = extractHttpStatus(e);
-        const statusInfo = status ? ` [HTTP ${status}]` : '';
-        throw new Error(`API请求失败${statusInfo}: ${e.message || '未知错误'}`);
-      }
-    }
-
-    throw new Error('需要酒馆助手 generateRaw 接口，请更新或启用酒馆助手。');
   }
-);
-
-const callMegaSummaryApi = errorCatched(
-  async ({ promptBlocks, oldMegaSummaryContent, mergedSummaryText }) => {
-    const settings = getSettings();
-    const customApi = buildCustomApiConfig(settings);
-    const useNoTrans = settings.noTransTag !== false;
-    const NO_TRANS = settings.noTransTagValue || '<|no-trans|>';
-    const wrapContent = (text) => (useNoTrans ? `${NO_TRANS}${text}` : text);
-
-    const orderedPrompts = [];
-    for (const block of promptBlocks) {
-      if (!block.enabled) continue;
-      switch (block.type) {
-        case BLOCK_TYPES.PROMPT: {
-          const content = replaceMacros(block.content || '');
-          if (content.trim()) {
-            orderedPrompts.push({
-              role: block.role || 'system',
-              content: wrapContent(content),
-            });
-          }
-          break;
-        }
-        case BLOCK_TYPES.BUILTIN_GROUP: {
-          orderedPrompts.push(...BUILTIN_PROMPTS);
-          break;
-        }
-        case BLOCK_TYPES.OLD_SUMMARY: {
-          if (oldMegaSummaryContent && oldMegaSummaryContent.trim()) {
-            orderedPrompts.push({
-              role: block.role || 'system',
-              content: wrapContent(
-                `<existing_mega_summary>\n${oldMegaSummaryContent}\n</existing_mega_summary>`
-              ),
-            });
-          }
-          break;
-        }
-        case BLOCK_TYPES.CHAT_MESSAGES: {
-          if (mergedSummaryText && mergedSummaryText.trim()) {
-            const lead = block.leadText || '以下是需要进行大总结的总结条目内容：';
-            const xmlTag = block.xmlTag || 'summary_records';
-            orderedPrompts.push({
-              role: block.role || 'user',
-              content: wrapContent(
-                `${lead}\n<${xmlTag}>\n${mergedSummaryText}\n</${xmlTag}>`
-              ),
-            });
-          }
-          break;
-        }
-      }
-    }
-
-    const config = { should_silence: true, ordered_prompts: orderedPrompts };
-    if (customApi) config.custom_api = customApi;
-
-    let generateRawFn =
-      (typeof generateRaw !== 'undefined' ? generateRaw : undefined) ||
-      (typeof window !== 'undefined'
-        ? window.generateRaw || (window.parent && window.parent.generateRaw)
-        : undefined);
-
-    if (generateRawFn) {
-      try {
-        const result = await requestGeneration(generateRawFn, config);
-        assertCurrent();
-        return result ? String(result).trim() : '';
-      } catch (e) {
-        if (e.name === "AbortError") throw e;
-        const status = extractHttpStatus(e);
-        const statusInfo = status ? ` [HTTP ${status}]` : '';
-        throw new Error(`API请求失败${statusInfo}: ${e.message || '未知错误'}`);
-      }
-    }
-
-    throw new Error('需要酒馆助手 generateRaw 接口，请更新或启用酒馆助手。');
+  if(Object.keys(custom).length)config.custom_api=custom;
+  return { config, prefill: compiled.prefill, resultFormat: compiled.resultFormat, macroValues: compiled.macroValues };
+}
+export async function sendPreparedGeneration(prepared, settings = getSettings()) {
+  const generate = generationApi();
+  if (!generate) throw new Error('需要酒馆助手 generateRaw 接口，请更新或启用酒馆助手');
+  try { return String(await requestGeneration(config => generate(config), structuredClone(prepared.config)) ?? '').trim(); }
+  catch (error) {
+    if (error.name === 'AbortError') throw error;
+    const status = extractHttpStatus(error);
+    const failure = new Error(safeErrorDetails(error, [settings.customApiKey])); failure.status = status; throw failure;
   }
-);
+}
+const callSummaryApi = async (params, settings = getSettings()) => sendPreparedGeneration(await prepareGeneration(params, settings), settings);
+const callMegaSummaryApi = callSummaryApi;
+export async function testConnection(settings = getSettings()) {
+  const config = { should_silence: true, max_chat_history: 0, ordered_prompts: [{ role: 'user', content: '请只回复 OK。' }], overrides: { chat_history: { prompts: [], with_depth_entries: false } }, custom_api: { ...buildCustomApiConfig(settings), max_tokens: 32 } };
+  const text = await sendPreparedGeneration({ config }, settings); if (!text.trim()) throw new Error('连接已返回，但内容为空'); return true;
+}
 
 const fetchModelList = errorCatched(async (apiUrl, apiKey) => {
   if (!apiUrl) throw new Error('请先填写API地址');
@@ -232,30 +86,22 @@ const fetchModelList = errorCatched(async (apiUrl, apiKey) => {
       const result = await getModelListFn(params);
       // 验证返回结果是否为有效的模型列表
       if (result && Array.isArray(result) && result.length > 0) {
-        console.log('Successfully fetched models via getModelList:', result.length);
         return result;
       }
-      console.warn('getModelList returned invalid data, falling back to fetch:', result);
     } catch (e) {
-      console.warn('Global getModelList failed, falling back to fetch', e);
       // 如果是明确的错误（如权限问题），不要fallback
       const status = extractHttpStatus(e);
       if (status && (status === 401 || status === 403)) {
-        throw new Error(`API认证失败 [HTTP ${status}]: ${e.message || '请检查API密钥'}`);
+        throw new Error(`API认证失败 [HTTP ${status}]，请检查密钥与权限`);
       }
     }
   }
 
-  let url = apiUrl.trim();
-  if (!url.endsWith('/')) url += '/';
-  if (!url.endsWith('models/') && !url.endsWith('models')) {
-    url += 'models';
-  }
+  const url = apiUrl.trim().replace(/\/(?:chat\/completions|completions|responses|models)\/?$/, '').replace(/\/$/, '') + '/models';
   const headers = { 'Content-Type': 'application/json' };
   if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
 
   try {
-    console.log('Fetching models from:', url);
     const res = await fetch(url, { method: 'GET', headers });
     if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
     const data = await res.json();
@@ -267,7 +113,7 @@ const fetchModelList = errorCatched(async (apiUrl, apiKey) => {
     }
     throw new Error('响应格式无法解析');
   } catch (e) {
-    throw new Error(`获取模型列表失败: ${e.message} (尝试 URL: ${url})`);
+    throw new Error('获取模型列表失败：' + safeErrorDetails(e, [apiKey]));
   }
 });
 

@@ -1,8 +1,8 @@
-import { assertCurrent } from '../platform/lifecycle.js';
+import { assertCurrent, captureContext, checkContext } from '../platform/lifecycle.js';
 /**
  * errorHandler.js
  * 全局错误处理包装器
- * 将 async 函数包装为自动捕获异常并显示 toastr 提示的版本
+ * 异步操作前后校验上下文，由调用方显示错误反馈。
  */
 
 /**
@@ -49,6 +49,12 @@ const formatErrorMessage = (error) => {
   return baseMsg;
 };
 
-function errorCatched(fn) { return async (...args) => { assertCurrent(); const result = await fn(...args); assertCurrent(); return result; }; }
+function errorCatched(fn) { return async (...args) => { assertCurrent(); const token = captureContext(); const result = await fn(...args); checkContext(token); return result; }; }
+
+export function safeErrorDetails(error, secrets = []) {
+  let text = String(error?.message ?? error ?? '未知错误');
+  for (const secret of secrets.filter(Boolean)) text = text.split(secret).join('[已隐藏]');
+  return text.replace(/https?:\/\/[^\s<>"']+/gi, '[接口地址已隐藏]').replace(/(Bearer\s+|(?:key|token|authorization)["'\s:=]+)[^\s,;"'}]+/gi, '$1[已隐藏]').slice(0, 1200);
+}
 
 export { extractHttpStatus, formatErrorMessage, errorCatched };

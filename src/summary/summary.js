@@ -1,660 +1,106 @@
-import { formatErrorMessage, errorCatched } from './errorHandler.js';
-import { escapeHtml, makeSummaryEntryName, parseSummaryEntryName, parseMegaSummaryEntryName, normalizeWorldbookEntries } from './utils.js';
 import { getSettings, getMegaSummaryMapping } from './storage.js';
-import { callSummaryApi, callMegaSummaryApi } from './api.js';
-import { getActiveWorldbookName, applySummarizedFloorsVisibility, upsertSummaryEntryByName, getLastSummarizedFloor, upsertMegaSummaryEntry } from './worldbook.js';
-import { buildSummaryPromptParams, buildRegeneratePromptParams, buildMegaSummaryPromptParams, buildRegenerateMegaSummaryPromptParams } from './prompt.js';
-import { assertCurrent, getHost, SillyTavern, updateWorldbookWith } from '../platform/lifecycle.js';
-const showSummaryHint = (text, variant = 'info') => getHost().status(text, variant);
-const hideSummaryHint = () => {};
-const showSummaryHintFor = showSummaryHint;
-const chooseSummaryFailureAction = options => { assertCurrent(); return getHost().chooseFailure(options); };
-// ---- 返回内容校验 ----
+import { getCoverage, auditArchiveSources, applySummarizedFloorsVisibility, upsertSummaryEntryByName, upsertMegaSummaryEntry, isEntryDisabled } from './worldbook.js';
+import { validateResultBody } from './result.js';
+import { getRawMessages } from './messages.js';
+import { makeSummaryEntryName, makeMegaSummaryEntryName } from './utils.js';
+import { parseRange, excludeRange, consecutiveSummaries, recordValid } from './provenance.js';
+import { getTask, clearTask, updatePendingTask, taskBatchFields } from './taskState.js';
+import { getHost, captureContext, checkContext } from '../platform/lifecycle.js';
+import { runSummaryTask } from './taskRunner.js';
+import { splitFloorBatches, batchTaskSpec } from './batchPlan.js';
 
-const SUMMARY_INVALID_PATTERNS = [
-  /^(?:error|invalid request|rate limit|context length exceeded|server error|network error|unauthorized|forbidden)\b[\s\S]*$/i,
-  /^(?:请求失败|连接失败|服务错误|服务器错误|上下文长度超限|余额不足|未授权|无权限|模型忙)[：:，,\s]*[\s\S]*$/i,
-  /^(?:HTTP\s*)?\d{3}\b[\s\S]*(?:error|invalid request|server error|network error|unauthorized|forbidden|请求失败|连接失败|服务错误|服务器错误|未授权|无权限)/i,
-];
+export const showSummaryHint = (message, kind = 'info') => getHost()?.status(message, kind);
+export const hideSummaryHint = () => {};
+export const showSummaryHintFor = showSummaryHint;
+export const chooseSummaryFailureAction = options => getHost()?.chooseFailure(options);
+export const stripMarkdownCodeFence = text => String(text ?? '').trim().replace(/^```[^\n]*\n([\s\S]*?)\n```$/, '$1');
+export const normalizeSummaryFormatting = text => String(text ?? '').trim();
+export const containsMarkdownCodeFence = text => /```/.test(text);
+export function validateSummaryContent(text, options = {}) { try { validateResultBody(text, options.format); return ''; } catch (error) { return error.message; } }
+export const SUMMARY_INVALID_PATTERNS = [], SUMMARY_LAZY_PATTERNS = [], SUMMARY_WRAPPER_LINE_PATTERNS = [], SUMMARY_HEADER_PATTERN = /^---\s*\r?\n[^\r\n]+[:：]\s*$/m;
+export const finalizeSummarySave = (name, content) => upsertSummaryEntryByName(name, content);
+export const finalizeMegaSummarySave = (name, content, names) => upsertMegaSummaryEntry(name, content, names);
 
-const SUMMARY_LAZY_PATTERNS = [
-  /(其余省略|类似上文|照旧|同前|以下省略|无需赘述)/i,
-];
-
-const SUMMARY_HEADER_PATTERN = /^---\s*[\r\n]+[^\r\n:][^\r\n]*:\s*$/m;
-
-const SUMMARY_WRAPPER_LINE_PATTERNS = [
-  /^\s*以下是(?:本次)?(?:总结|整合结果|整合后的记录|记录内容)[：:]\s*$/i,
-  /^\s*(?:总结|整合)(?:如下)?[：:]\s*$/i,
-];
-
-const stripMarkdownCodeFence = (content) => {
-  let text = typeof content === "string" ? content.trim() : "";
-  if (!text) return "";
-
-  while (true) {
-    const fencedMatch = text.match(/^```[^\r\n]*\r?\n([\s\S]*?)\r?\n```$/);
-    if (fencedMatch) {
-      text = fencedMatch[1].trim();
-      continue;
-    }
-
-    const lines = text.split(/\r?\n/);
-    if (
-      lines.length >= 3 &&
-      SUMMARY_WRAPPER_LINE_PATTERNS.some((pattern) => pattern.test(lines[0])) &&
-      /^```[^\r\n]*\s*$/.test(lines[1]) &&
-      /^\s*```\s*$/.test(lines[lines.length - 1])
-    ) {
-      text = lines.slice(2, -1).join("\n").trim();
-      continue;
-    }
-
-    break;
+export async function computeSummaryPlans(settings = getSettings()) {
+  const lastId = getLastMessageId(); if (lastId < 0) return [];
+  const { floors, archive, entries } = await getCoverage();
+  const ignored = [...archive.excluded, ...entries.filter(entry => isEntryDisabled(entry) && !archive.records[entry.name]?.invalid).map(entry => parseRange(entry.name)).filter(Boolean)];
+  const isIgnored = id => ignored.some(range => id >= range.start && id <= range.end);
+  const raw = await getRawMessages(0, lastId);
+  const outstanding = raw.filter(message => !floors.has(message.id) && !isIgnored(message.id));
+  const eligible = outstanding.filter(message => message.id <= lastId - settings.keepFloorCount);
+  return splitFloorBatches(eligible,settings.batchFloorCount).map(plan=>({...plan,lastId,unsummarizedCount:outstanding.length}));
+}
+export async function computeSummaryPlan() { return (await computeSummaryPlans())[0]??null; }
+export async function shouldAutoTrigger() { const plan = await computeSummaryPlan(); return !!plan && plan.unsummarizedCount >= getSettings().triggerFloorCount; }
+export async function computeMegaPlan() {
+  const settings = getSettings(); if (!settings.autoMegaSummary) return null;
+  const { entries, archive, sources } = await getCoverage();
+  const normals = entries.filter(entry => entry.name.startsWith('总结') && parseRange(entry.name) && !isEntryDisabled(entry) && recordValid(entry, archive, sources, entries)).sort((a, b) => parseRange(a.name).start - parseRange(b.name).start);
+  if (normals.length < settings.megaTriggerCount) return null;
+  for (let i = 0; i <= normals.length - settings.megaBatchCount; i++) {
+    const names = normals.slice(i, i + settings.megaBatchCount).map(entry => entry.name);
+    try {
+      const ranges = consecutiveSummaries(names), entryName = makeMegaSummaryEntryName(ranges[0].start, ranges.at(-1).end);
+      if (!archive.megaExcluded.some(name=>{const range=parseRange(name);return range&&range.end>=ranges[0].start&&range.start<=ranges.at(-1).end;})) return { summaryNames: names, entryName };
+    } catch { /* Skip a gap, never claim its intervening floors. */ }
   }
-
-  return text;
-};
-
-const containsMarkdownCodeFence = (content) => {
-  const text = typeof content === "string" ? content : "";
-  return /(^|\r?\n)\s*```[^\r\n]*\s*(\r?\n|$)/.test(text);
-};
-
-const normalizeSummaryFormatting = (content) => {
-  const text = typeof content === "string" ? content : "";
-  if (!text) return "";
-
-  let normalized = text.replace(
-    /(^|\r?\n)\s*(?:\*\*\*|___)\s*(?=\r?\n|$)/g,
-    "$1---",
-  );
-
-  const lines = normalized.split(/\r?\n/);
-  const firstMeaningfulLineIndex = lines.findIndex((line) => line.trim());
-  if (firstMeaningfulLineIndex >= 0) {
-    const firstMeaningfulLine = lines[firstMeaningfulLineIndex].trim();
-    const previousMeaningfulLine = lines
-      .slice(0, firstMeaningfulLineIndex)
-      .reverse()
-      .find((line) => line.trim());
-
-    const looksLikeHeader = /^[^\r\n:][^\r\n]*:\s*$/.test(firstMeaningfulLine);
-    const hasLeadingSeparator = firstMeaningfulLine === "---";
-    const hasPreviousSeparator =
-      (previousMeaningfulLine || "").trim() === "---";
-
-    if (looksLikeHeader && !hasLeadingSeparator && !hasPreviousSeparator) {
-      lines.splice(firstMeaningfulLineIndex, 0, "---");
-      normalized = lines.join("\n");
-    }
-  }
-
-  return normalized;
-};
-
-const validateSummaryContent = (content, { kind = "总结" } = {}) => {
-  const text = normalizeSummaryFormatting(stripMarkdownCodeFence(content));
-  if (!text) {
-    return `${kind}未保存：AI没有返回任何有效内容。`;
-  }
-  if (SUMMARY_INVALID_PATTERNS.some((pattern) => pattern.test(text))) {
-    return `${kind}未保存：检测到返回内容包含疑似报错信息。`;
-  }
-  if (SUMMARY_LAZY_PATTERNS.some((pattern) => pattern.test(text))) {
-    return `${kind}未保存：检测到“同前/省略/照旧”类偷懒表达。`;
-  }
-  if (containsMarkdownCodeFence(text)) {
-    return `${kind}未保存：检测到残留的 Markdown 代码块围栏。`;
-  }
-  if (!text.includes("---")) {
-    return `${kind}未保存：缺少 "---" 分段结构。`;
-  }
-  if (!SUMMARY_HEADER_PATTERN.test(text)) {
-    return `${kind}未保存：缺少有效的分段标题格式。`;
-  }
-  return "";
-};
-
-const finalizeSummarySave = async (entryName, content, successText = null) => {
-  await upsertSummaryEntryByName(entryName, content);
-  showSummaryHintFor(
-    successText || `总结已生成：${entryName}`,
-    "success",
-    3200,
-  );
-  toastr.success(successText || `总结已保存：${entryName}`);
-};
-
-const finalizeMegaSummarySave = async (
-  entryName,
-  content,
-  summaryNames,
-  successText = null,
-) => {
-  await upsertMegaSummaryEntry(entryName, content, summaryNames);
-
-  const wbName = getActiveWorldbookName();
-  if (wbName) {
-    await updateWorldbookWith(wbName, (wb) => {
-      const arr = normalizeWorldbookEntries(wb);
-      for (const summaryName of summaryNames) {
-        const entry = arr.find((e) => e && e.name === summaryName);
-        if (entry) {
-          entry.enabled = false;
-          entry.disable = true;
-          if ("disabled" in entry) entry.disabled = true;
-        }
-      }
-      return Array.isArray(wb) ? arr : { ...wb, entries: arr };
-    });
-
-    const settings = getSettings();
-    if (settings.autoHideSummarizedFloors !== false) {
-      await applySummarizedFloorsVisibility();
-    }
-  }
-
-  showSummaryHintFor(
-    successText || `大总结已生成：${entryName}`,
-    "success",
-    3200,
-  );
-  toastr.success(successText || `大总结已保存：${entryName}`);
-};
-
-// ---- 总结计划 ----
-
-const computeSummaryPlan = errorCatched(async () => {
-  const settings = getSettings();
+  return null;
+}
+export async function validateManualSummaryRange(start, end, { replacing = false } = {}) {
   const lastId = getLastMessageId();
-  if (lastId < 0) return null;
-  const lastSummarized = await getLastSummarizedFloor();
-  const startFloor = lastSummarized + 1;
-  const endFloor = lastId - settings.keepFloorCount;
-  if (endFloor < startFloor) return null;
-  return {
-    startFloor,
-    endFloor,
-    entryName: makeSummaryEntryName(startFloor, endFloor),
-    lastId,
-    unsummarizedCount: lastId - lastSummarized,
-  };
-});
-
-const shouldAutoTrigger = errorCatched(async () => {
-  const settings = getSettings();
-  const lastId = getLastMessageId();
-  if (lastId < 0) return false;
-  const lastSummarized = await getLastSummarizedFloor();
-  const unsummarizedCount = lastId - lastSummarized;
-  return unsummarizedCount >= settings.triggerFloorCount;
-});
-
-// ---- 执行总结 ----
-
-const validateManualSummaryRange = async (startFloor, endFloor) => {
-  const lastId = getLastMessageId();
-  if (lastId < 0) {
-    return { ok: false, message: "聊天为空，无法生成总结。" };
-  }
-  if (!Number.isInteger(startFloor) || !Number.isInteger(endFloor)) {
-    return { ok: false, message: "请输入有效的整数楼层范围。" };
-  }
-  if (startFloor < 0 || endFloor < 0) {
-    return { ok: false, message: "楼层范围不能小于 0。" };
-  }
-  if (startFloor > endFloor) {
-    return { ok: false, message: "起始楼层不能大于结束楼层。" };
-  }
-  if (startFloor > lastId) {
-    return {
-      ok: false,
-      message: `起始楼层超出当前聊天范围（最后一楼=${lastId}）。`,
-    };
-  }
-  if (endFloor > lastId) {
-    return {
-      ok: false,
-      message: `结束楼层超出当前聊天范围（最后一楼=${lastId}）。`,
-    };
-  }
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || start > end || end > lastId) return { ok: false, message: '请输入当前聊天内有效的整数楼层范围。' };
+  if (!replacing) { const { floors } = await getCoverage(); for (let id = start; id <= end; id++) if (floors.has(id)) return { ok: false, message: '范围与有效总结重叠，请使用对应条目的重新生成。' }; }
   return { ok: true, lastId };
-};
-
-const startSummaryProcess = errorCatched(async () => {
+}
+export async function executeSummary(startFloor, endFloor, entryName, options = {}) {
+  if(options.regenerate){const {entries,megaMap}=await getCoverage();if(entries.some(entry=>!isEntryDisabled(entry)&&megaMap[entry.name]?.includes(entryName)))throw new Error('该条目已被大总结包含，请先回档对应的大总结再重生成');}
+  const validation = await validateManualSummaryRange(startFloor, endFloor, { replacing: options.regenerate });
+  if (!validation.ok) throw new Error(validation.message);
+  if(!options.regenerate){
+    const raw=await getRawMessages(startFloor,endFloor),plans=splitFloorBatches(raw,getSettings().batchFloorCount,{exactEnd:true});
+    if(plans.reduce((count,plan)=>count+plan.endFloor-plan.startFloor+1,0)!==raw.length)throw new Error('每批上限太小，无法按完整回复拆分；请提高每批最多楼层数');
+    if(plans.length>1)return runSummaryTask(batchTaskSpec(plans));
+  }
+  return runSummaryTask({ kind: 'normal', startFloor, endFloor, entryName, regenerate: !!options.regenerate });
+}
+export async function executeMegaSummary(summaryNames, entryName, options = {}) {
+  const ranges = consecutiveSummaries(summaryNames);
+  return runSummaryTask({ kind: 'mega', summaryNames, entryName, startFloor: ranges[0].start, endFloor: ranges.at(-1).end, regenerate: !!options.regenerate });
+}
+export async function retryTask(mode, body) {
+  const previous = getTask(); if (!previous || previous.running) return;
+  return runSummaryTask(previous.spec, { previous, mode, editedBody: body });
+}
+export function skipPendingTask() {
+  const task = getTask(); if (!task || task.running) return;
+  const index=task.selectedBatch??0,batch=task.batches?.[index],spec=batch?.spec??task.spec;
+  excludeRange(spec.entryName,{mega:spec.kind==='mega'});
+  if(task.batches?.length>1){
+    const batches=task.batches;batches[index].phase='skipped';
+    const next=batches.findIndex(item=>!['complete','skipped','paused'].includes(item.phase));
+    if(next>=0){updatePendingTask({...taskBatchFields(batches[next]),batches,selectedBatch:next,phase:'pending',message:'已跳过此批，其他批次可继续处理'});return;}
+  }
+  clearTask();
+}
+export async function startSummaryProcess() { const plans=await computeSummaryPlans();if(!plans.length)return showSummaryHint('当前没有可以总结的完整楼层范围');return runSummaryTask(batchTaskSpec(plans)); }
+export async function startCustomRangeSummaryProcess() {
   const plan = await computeSummaryPlan();
-  if (!plan) {
-    toastr.warning("当前没有需要总结的楼层。");
-    return;
+  const last=getLastMessageId();if(last<0)return showSummaryHint('聊天中还没有可总结的楼层');
+  const input=await getHost().form({title:'指定楼层总结',message:`楼层从 0 开始，当前最后一楼为 ${last}。`,fields:[{name:'start',label:'起始楼层',type:'number',min:0,max:last,step:1,value:plan?.startFloor??0},{name:'end',label:'结束楼层',type:'number',min:0,max:last,step:1,value:plan?.endFloor??last}],choices:[['开始总结','__form__'],['取消',null]],validate:value=>Number.isInteger(value.start)&&Number.isInteger(value.end)&&value.start>=0&&value.end>=value.start&&value.end<=last?'':`请填写 0—${last} 之间、起点不大于终点的整数。`});
+  if(!input)return;
+  return executeSummary(input.start,input.end,makeSummaryEntryName(input.start,input.end));
+}
+export async function regenerateAndReplaceEntry(name) { const range = parseRange(name); if (!range) throw new Error('条目名称无效'); return executeSummary(range.start, range.end, name, { regenerate: true }); }
+export async function regenerateAndReplaceMegaEntry(name) { const names = await getMegaSummaryMapping(name); if (!names?.length) throw new Error('未找到原始总结来源'); return executeMegaSummary(names, name, { regenerate: true }); }
+export async function autoTriggerSummary() {
+  const token = captureContext();
+  await auditArchiveSources(); await applySummarizedFloorsVisibility(); checkContext(token);
+  while (getSettings().enabled && !['pending','stopped'].includes(getTask()?.phase)) {
+    const mega = await computeMegaPlan(); checkContext(token);
+    if (mega) { if (!await executeMegaSummary(mega.summaryNames, mega.entryName)) break; continue; }
+    const plans = await computeSummaryPlans(); checkContext(token);
+    if (!plans.length || plans[0].unsummarizedCount < getSettings().triggerFloorCount) break;
+    if (!await runSummaryTask(batchTaskSpec(plans),{automatic:true})) break;
   }
-  const confirm = await SillyTavern.callGenericPopup(
-    `将总结以下楼层范围：\n\n` +
-      `起始楼层：${plan.startFloor}\n` +
-      `结束楼层：${plan.endFloor}\n` +
-      `条目名称：${escapeHtml(plan.entryName)}\n\n` +
-      `未总结消息数：${plan.unsummarizedCount}\n` +
-      `继续吗？`,
-    SillyTavern.POPUP_TYPE.CONFIRM,
-  );
-  if (confirm !== SillyTavern.POPUP_RESULT.AFFIRMATIVE) return;
-  await executeSummary(plan.startFloor, plan.endFloor, plan.entryName, {
-    requireReview: true,
-  });
-});
-
-const startCustomRangeSummaryProcess = errorCatched(async () => {
-  const settings = getSettings();
-  const lastId = getLastMessageId();
-  if (lastId < 0) {
-    toastr.warning("聊天为空，无法生成总结。");
-    return;
-  }
-  const lastSummarized = await getLastSummarizedFloor();
-  const suggestedStart = Math.max(0, lastSummarized + 1);
-  const suggestedEnd = Math.max(
-    suggestedStart,
-    lastId - settings.keepFloorCount,
-  );
-  const suggestedRange = `${suggestedStart}-${suggestedEnd}`;
-  const result = await SillyTavern.callGenericPopup(
-    `请输入需要总结的楼层范围（当前最后一楼：${lastId}）。\n\n` +
-      `推荐范围：${suggestedRange}\n` +
-      `格式示例：12-34`,
-    SillyTavern.POPUP_TYPE.INPUT,
-    suggestedRange,
-    {
-      rows: 1,
-      okButton: "下一步",
-      cancelButton: "取消",
-    },
-  );
-  if (typeof result !== "string") return;
-  const match = result.trim().match(/^(\d+)\s*-\s*(\d+)$/);
-  if (!match) {
-    toastr.warning('请输入正确格式的楼层范围，例如 "12-34"。');
-    return;
-  }
-  const startFloor = Number.parseInt(match[1], 10);
-  const endFloor = Number.parseInt(match[2], 10);
-  const validation = await validateManualSummaryRange(startFloor, endFloor);
-  if (!validation.ok) {
-    toastr.error(validation.message);
-    return;
-  }
-  const entryName = makeSummaryEntryName(startFloor, endFloor);
-  const confirm = await SillyTavern.callGenericPopup(
-    `将按指定范围生成总结：\n\n` +
-      `起始楼层：${startFloor}\n` +
-      `结束楼层：${endFloor}\n` +
-      `条目名称：${escapeHtml(entryName)}\n\n` +
-      `继续吗？`,
-    SillyTavern.POPUP_TYPE.CONFIRM,
-  );
-  if (confirm !== SillyTavern.POPUP_RESULT.AFFIRMATIVE) return;
-  await executeSummary(startFloor, endFloor, entryName, {
-    requireReview: true,
-  });
-});
-
-const executeSummary = errorCatched(
-  async (startFloor, endFloor, entryName, { requireReview = false } = {}) => {
-    assertCurrent();
-    if (!getSettings().enabled) throw new Error("请先启用总结功能");
-    showSummaryHint(
-      `正在生成总结，请稍候...\n总结范围：${startFloor} - ${endFloor} 楼`,
-    );
-    try {
-      const params = await buildSummaryPromptParams(startFloor, endFloor);
-      const aiMessage = await callSummaryApi(params);
-      const normalizedAiMessage = normalizeSummaryFormatting(
-        stripMarkdownCodeFence(aiMessage),
-      );
-      const invalidReason = validateSummaryContent(normalizedAiMessage, {
-        kind: "总结",
-      });
-      if (invalidReason) {
-        showSummaryHintFor(invalidReason, "error", 4200);
-        toastr.error(invalidReason);
-        const action = await chooseSummaryFailureAction({
-          title: "总结失败",
-          message: `${invalidReason}\n\n请选择后续操作：`,
-        });
-        if (action === "retry") {
-          await executeSummary(startFloor, endFloor, entryName, {
-            requireReview,
-          });
-        } else if (action === "review") {
-          const result = await SillyTavern.callGenericPopup(
-            `总结生成失败，可在下方手动编辑后保存（${escapeHtml(entryName)}）：`,
-            SillyTavern.POPUP_TYPE.INPUT,
-            normalizedAiMessage || invalidReason,
-            {
-              rows: 12,
-              wide: true,
-              okButton: "确定保存",
-              cancelButton: "取消",
-            },
-          );
-          if (typeof result === "string") {
-            await finalizeSummarySave(entryName, result);
-          } else {
-            showSummaryHintFor("已取消保存本次总结。", "info", 2200);
-            toastr.info("操作已取消。");
-          }
-        }
-        return;
-      }
-      let contentToSave = normalizedAiMessage;
-      if (requireReview) {
-        const result = await SillyTavern.callGenericPopup(
-          `AI生成的总结（将保存为：${escapeHtml(entryName)}），可在下方编辑：`,
-          SillyTavern.POPUP_TYPE.INPUT,
-          normalizedAiMessage,
-          { rows: 12, wide: true, okButton: "确定保存", cancelButton: "取消" },
-        );
-        if (typeof result !== "string") {
-          showSummaryHintFor("已取消保存本次总结。", "info", 2200);
-          toastr.info("操作已取消。");
-          return;
-        }
-        contentToSave = result;
-      }
-      await finalizeSummarySave(entryName, contentToSave);
-    } catch (error) {
-      if (error.name === "AbortError") throw error;
-      assertCurrent();
-      console.error("总结过程中出错:", error);
-      const errMsg = formatErrorMessage(error);
-      const fullErrorMessage = `总结失败：${errMsg}`;
-      showSummaryHintFor(fullErrorMessage, "error", 4200);
-      toastr.error(`总结失败: ${errMsg}`);
-      const action = await chooseSummaryFailureAction({
-        title: "总结失败",
-        message: `${fullErrorMessage}\n\n请选择后续操作：`,
-      });
-      if (action === "retry") {
-        await executeSummary(startFloor, endFloor, entryName, {
-          requireReview,
-        });
-      } else if (action === "review") {
-        const result = await SillyTavern.callGenericPopup(
-          `总结生成失败，可在下方手动编辑后保存（${escapeHtml(entryName)}）：`,
-          SillyTavern.POPUP_TYPE.INPUT,
-          fullErrorMessage,
-          { rows: 12, wide: true, okButton: "确定保存", cancelButton: "取消" },
-        );
-        if (typeof result === "string") {
-          await finalizeSummarySave(entryName, result);
-        } else {
-          showSummaryHintFor("已取消保存本次总结。", "info", 2200);
-          toastr.info("操作已取消。");
-        }
-      }
-    }
-  },
-);
-
-// ---- 重新生成 ----
-
-const regenerateAndReplaceEntry = errorCatched(async (entryName) => {
-  const parsed = parseSummaryEntryName(entryName);
-  if (!parsed) {
-    toastr.error('条目名不符合"总结x-y楼"格式。');
-    return;
-  }
-  const lastId = getLastMessageId();
-  if (lastId < 0) {
-    toastr.warning("聊天为空，无法生成。");
-    return;
-  }
-  const { start, end } = parsed;
-  if (start > lastId) {
-    toastr.error(`条目起始楼层超出当前聊天（最后一楼=${lastId}）。`);
-    return;
-  }
-  const confirm = await SillyTavern.callGenericPopup(
-    `将对条目「${escapeHtml(entryName)}」执行重新生成。\n\n` +
-      `流程：\n` +
-      `1) 提取 ${start}-${Math.min(end, lastId)} 楼的标签内容\n` +
-      `2) 发送该条目之前的总结作为上下文（不含该条目及之后的）\n` +
-      `3) 调用API生成总结并替换该条目内容\n\n` +
-      `继续吗？`,
-    SillyTavern.POPUP_TYPE.CONFIRM,
-  );
-  if (confirm !== SillyTavern.POPUP_RESULT.AFFIRMATIVE) return;
-  showSummaryHint(`正在重新生成条目，请稍候...\n目标条目：${entryName}`);
-  try {
-    const params = await buildRegeneratePromptParams(entryName);
-    const aiMessage = await callSummaryApi(params);
-    const normalizedAiMessage = normalizeSummaryFormatting(
-      stripMarkdownCodeFence(aiMessage),
-    );
-    const invalidReason = validateSummaryContent(normalizedAiMessage, {
-      kind: "总结",
-    });
-    if (invalidReason) {
-      showSummaryHintFor(
-        `${invalidReason}\n已打开审查窗口，可手动修正后替换保存。`,
-        "error",
-        5200,
-      );
-      toastr.warning(`${invalidReason} 已打开审查窗口，可手动修正后替换保存。`);
-    }
-    const reviewMessage = invalidReason
-      ? `重新生成的总结检测到问题（${escapeHtml(invalidReason)}），但仍可在下方手动修正后替换：`
-      : `重新生成的总结（${escapeHtml(entryName)}），可在下方编辑：`;
-    const result = await SillyTavern.callGenericPopup(
-      reviewMessage,
-      SillyTavern.POPUP_TYPE.INPUT,
-      normalizedAiMessage,
-      { rows: 12, wide: true, okButton: "确定替换", cancelButton: "取消" },
-    );
-    if (typeof result !== "string") {
-      showSummaryHintFor("已取消替换该条目。", "info", 2200);
-      toastr.info("操作已取消。");
-      return;
-    }
-    await upsertSummaryEntryByName(entryName, result);
-    showSummaryHintFor(`条目已重新生成：${entryName}`, "success", 3200);
-    toastr.success(`已重新生成并替换：${entryName}`);
-  } catch (error) {
-      if (error.name === "AbortError") throw error;
-      assertCurrent();
-    console.error("重新生成失败:", error);
-    const errMsg = formatErrorMessage(error);
-    showSummaryHintFor(`重新生成失败：${errMsg}`, "error", 4200);
-    toastr.error(`重新生成失败: ${errMsg}`);
-  }
-});
-
-// ---- 自动触发 ----
-
-const autoTriggerSummary = errorCatched(async () => {
-  if (!getSettings().enabled) return;
-  const should = await shouldAutoTrigger();
-  if (!should) return;
-  const settings = getSettings();
-  const plan = await computeSummaryPlan();
-  if (!plan) return;
-  if (settings.autoTriggerConfirm) {
-    const confirm = await SillyTavern.callGenericPopup(
-      `未总结消息已达 ${plan.unsummarizedCount} 条（触发阈值：${settings.triggerFloorCount}）。\n\n` +
-        `是否开始总结 ${plan.startFloor}-${plan.endFloor} 楼？\n` +
-        `确认后会在保存前提供结果审查窗口。`,
-      SillyTavern.POPUP_TYPE.CONFIRM,
-    );
-    if (confirm !== SillyTavern.POPUP_RESULT.AFFIRMATIVE) return;
-  }
-  await executeSummary(plan.startFloor, plan.endFloor, plan.entryName, {
-    requireReview: settings.autoTriggerConfirm,
-  });
-});
-
-// ---- 大总结流程 ----
-
-const executeMegaSummary = errorCatched(
-  async (summaryNames, entryName, { requireReview = false } = {}) => {
-    assertCurrent();
-    if (!getSettings().enabled) throw new Error("请先启用总结功能");
-    showSummaryHint(
-      `正在生成大总结，请稍候...\n总结条目数：${summaryNames.length}`,
-    );
-    try {
-      const params = await buildMegaSummaryPromptParams(summaryNames);
-      const aiMessage = await callMegaSummaryApi(params);
-      const normalizedAiMessage = normalizeSummaryFormatting(
-        stripMarkdownCodeFence(aiMessage),
-      );
-      const invalidReason = validateSummaryContent(normalizedAiMessage, {
-        kind: "大总结",
-      });
-      if (invalidReason) {
-        showSummaryHintFor(invalidReason, "error", 4200);
-        toastr.error(invalidReason);
-        const action = await chooseSummaryFailureAction({
-          title: "大总结失败",
-          message: `${invalidReason}\n\n请选择后续操作：`,
-        });
-        if (action === "retry") {
-          await executeMegaSummary(summaryNames, entryName, { requireReview });
-        } else if (action === "review") {
-          const result = await SillyTavern.callGenericPopup(
-            `大总结生成失败，可在下方手动编辑后保存（${escapeHtml(entryName)}）：`,
-            SillyTavern.POPUP_TYPE.INPUT,
-            normalizedAiMessage || invalidReason,
-            {
-              rows: 12,
-              wide: true,
-              okButton: "确定保存",
-              cancelButton: "取消",
-            },
-          );
-          if (typeof result === "string") {
-            await finalizeMegaSummarySave(entryName, result, summaryNames);
-          } else {
-            showSummaryHintFor("已取消保存本次大总结。", "info", 2200);
-            toastr.info("操作已取消。");
-          }
-        }
-        return;
-      }
-      let contentToSave = normalizedAiMessage;
-      if (requireReview) {
-        const result = await SillyTavern.callGenericPopup(
-          `AI生成的大总结（将保存为：${escapeHtml(entryName)}），可在下方编辑：`,
-          SillyTavern.POPUP_TYPE.INPUT,
-          normalizedAiMessage,
-          { rows: 12, wide: true, okButton: "确定保存", cancelButton: "取消" },
-        );
-        if (typeof result !== "string") {
-          showSummaryHintFor("已取消保存本次大总结。", "info", 2200);
-          toastr.info("操作已取消。");
-          return;
-        }
-        contentToSave = result;
-      }
-
-      await finalizeMegaSummarySave(entryName, contentToSave, summaryNames);
-    } catch (error) {
-      if (error.name === "AbortError") throw error;
-      assertCurrent();
-      console.error("大总结过程中出错:", error);
-      const errMsg = formatErrorMessage(error);
-      const fullErrorMessage = `大总结失败：${errMsg}`;
-      showSummaryHintFor(fullErrorMessage, "error", 4200);
-      toastr.error(`大总结失败: ${errMsg}`);
-      const action = await chooseSummaryFailureAction({
-        title: "大总结失败",
-        message: `${fullErrorMessage}\n\n请选择后续操作：`,
-      });
-      if (action === "retry") {
-        await executeMegaSummary(summaryNames, entryName, { requireReview });
-      } else if (action === "review") {
-        const result = await SillyTavern.callGenericPopup(
-          `大总结生成失败，可在下方手动编辑后保存（${escapeHtml(entryName)}）：`,
-          SillyTavern.POPUP_TYPE.INPUT,
-          fullErrorMessage,
-          { rows: 12, wide: true, okButton: "确定保存", cancelButton: "取消" },
-        );
-        if (typeof result === "string") {
-          await finalizeMegaSummarySave(entryName, result, summaryNames);
-        } else {
-          showSummaryHintFor("已取消保存本次大总结。", "info", 2200);
-          toastr.info("操作已取消。");
-        }
-      }
-    }
-  },
-);
-
-const regenerateAndReplaceMegaEntry = errorCatched(async (entryName) => {
-  const parsed = parseMegaSummaryEntryName(entryName);
-  if (!parsed) {
-    toastr.error('条目名不符合"大总结x-y楼"格式。');
-    return;
-  }
-
-  const summaryNames = await getMegaSummaryMapping(entryName);
-  if (!summaryNames || summaryNames.length === 0) {
-    toastr.error("未找到该大总结的原始总结条目映射。");
-    return;
-  }
-
-  const confirm = await SillyTavern.callGenericPopup(
-    `将对大总结条目「${escapeHtml(entryName)}」执行重新生成。\n\n` +
-      `流程：\n` +
-      `1) 提取原始总结条目的内容（共${summaryNames.length}个）\n` +
-      `2) 发送该大总结之前的大总结作为上下文（不含该大总结及之后的）\n` +
-      `3) 调用API生成大总结并替换该条目内容\n\n` +
-      `继续吗？`,
-    SillyTavern.POPUP_TYPE.CONFIRM,
-  );
-  if (confirm !== SillyTavern.POPUP_RESULT.AFFIRMATIVE) return;
-
-  showSummaryHint(`正在重新生成大总结条目，请稍候...\n目标条目：${entryName}`);
-  try {
-    const params = await buildRegenerateMegaSummaryPromptParams(entryName);
-    const aiMessage = await callMegaSummaryApi(params);
-    const normalizedAiMessage = normalizeSummaryFormatting(
-      stripMarkdownCodeFence(aiMessage),
-    );
-    const invalidReason = validateSummaryContent(normalizedAiMessage, {
-      kind: "大总结",
-    });
-    if (invalidReason) {
-      showSummaryHintFor(
-        `${invalidReason}\n已打开审查窗口，可手动修正后替换保存。`,
-        "error",
-        5200,
-      );
-      toastr.warning(`${invalidReason} 已打开审查窗口，可手动修正后替换保存。`);
-    }
-    const reviewMessage = invalidReason
-      ? `重新生成的大总结检测到问题（${escapeHtml(invalidReason)}），但仍可在下方手动修正后替换：`
-      : `重新生成的大总结（${escapeHtml(entryName)}），可在下方编辑：`;
-    const result = await SillyTavern.callGenericPopup(
-      reviewMessage,
-      SillyTavern.POPUP_TYPE.INPUT,
-      normalizedAiMessage,
-      { rows: 12, wide: true, okButton: "确定替换", cancelButton: "取消" },
-    );
-    if (typeof result !== "string") {
-      showSummaryHintFor("已取消替换该大总结条目。", "info", 2200);
-      toastr.info("操作已取消。");
-      return;
-    }
-    await upsertMegaSummaryEntry(entryName, result, summaryNames);
-    showSummaryHintFor(`大总结条目已重新生成：${entryName}`, "success", 3200);
-    toastr.success(`已重新生成并替换：${entryName}`);
-  } catch (error) {
-      if (error.name === "AbortError") throw error;
-      assertCurrent();
-    console.error("重新生成大总结失败:", error);
-    const errMsg = formatErrorMessage(error);
-    showSummaryHintFor(`重新生成失败：${errMsg}`, "error", 4200);
-    toastr.error(`重新生成失败: ${errMsg}`);
-  }
-});
-
-export { showSummaryHint, hideSummaryHint, showSummaryHintFor, chooseSummaryFailureAction, SUMMARY_INVALID_PATTERNS, SUMMARY_LAZY_PATTERNS, SUMMARY_HEADER_PATTERN, SUMMARY_WRAPPER_LINE_PATTERNS, stripMarkdownCodeFence, containsMarkdownCodeFence, normalizeSummaryFormatting, validateSummaryContent, finalizeSummarySave, finalizeMegaSummarySave, computeSummaryPlan, shouldAutoTrigger, validateManualSummaryRange, startSummaryProcess, startCustomRangeSummaryProcess, executeSummary, regenerateAndReplaceEntry, autoTriggerSummary, executeMegaSummary, regenerateAndReplaceMegaEntry };
+}

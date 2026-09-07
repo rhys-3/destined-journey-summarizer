@@ -58,6 +58,7 @@ import * as summary from '../summary/service.js';
 import { createDialogs, DIALOG_STYLES } from '../ui/dialogs.js';
 import { PANEL_CSS } from '../ui/styles.js';
 import { SUMMARY_STYLES } from '../summary/ui/styles.js';
+import { TASK_STYLES } from '../summary/ui/taskView.js';
 export async function startPresetAssistant() {
   'use strict';
 
@@ -612,7 +613,7 @@ export async function startPresetAssistant() {
 
   // Named configurations contain data only; never embed scripts, extensions or the library itself.
 
-  const STYLES = PANEL_CSS + SUMMARY_STYLES + DIALOG_STYLES;
+  const STYLES = PANEL_CSS + SUMMARY_STYLES + DIALOG_STYLES + TASK_STYLES;
 
   globalThis.__destinedJourneyAssistant = { destroy: cleanup, open: openPanel };
   try {
@@ -627,11 +628,14 @@ export async function startPresetAssistant() {
   syncEntryPoints();
 
   createUi();
-  dialogs = createDialogs({ getRoot: () => shadow, open: openPanel });
+  dialogs = createDialogs({ getRoot: () => shadow, open: () => { if (!state.open) openPanel(); } });
   await summary.initialize({
     popup: (...args) => dialogs.popup(...args),
     chooseFailure: options => dialogs.chooseFailure(options),
-    status: (message, kind) => setSaveStatus(kind === 'error' ? 'error' : kind === 'success' ? 'saved' : 'idle', message),
+    status: (message, kind) => { state.summaryFeedback={message,kind};renderStatus(); },
+    getRoot: () => shadow?.querySelector('.destined-root'),
+    viewText: (title, value) => dialogs.viewText(title,value),
+    form: options => dialogs.form(options),
     openSummary: () => { state.activeTab = 'summary'; openPanel(); },
     changed: () => { const slot = shadow?.querySelector('.configuration-shortcut'); if(slot)slot.innerHTML=renderConfigurationShortcut(); },
   });

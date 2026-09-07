@@ -1,4 +1,4 @@
-import { PRESET_PROMPTS } from './presetDefaults.js';
+import { ARCHIVE_PROMPTS as PRESET_PROMPTS, PROMPT_VERSION } from './archiveDefaults.js';
 
 /**
  * config.js
@@ -41,26 +41,34 @@ const DEFAULT_PROMPT_BLOCKS = PRESET_PROMPTS.promptBlocks;
 const DEFAULT_MEGA_SUMMARY_PROMPT_BLOCKS = PRESET_PROMPTS.megaPromptBlocks;
 
 const DEFAULT_SETTINGS = {
+  behaviorVersion: 1,
   enabled: false,
   apiMode: "tavern",
   customApiUrl: "",
   customApiKey: "",
   customApiModel: "",
   customApiSource: "openai",
-  temperature: 1,
-  maxTokens: 32000,
+  temperature: 'same_as_preset',
+  maxTokens: 'same_as_preset',
   includeTags: ["tp", "gametxt"],
-  excludeTags: ["think"],
+  excludeTags: [],
   excludeHtmlComments: true,
   triggerFloorCount: 30,
   keepFloorCount: 10,
+  batchFloorCount: 20,
+  batchPreset: 'custom',
+  parallelBatches: false,
+  batchConcurrency: 2,
+  autoMegaSummary: true,
+  megaTriggerCount: 15,
+  megaBatchCount: 10,
+  customMacros: [],
+  promptVersion: PROMPT_VERSION,
   includeOldSummary: true,
   autoTriggerConfirm: false,
   autoHideSummarizedFloors: true,
   userPrefix: "{{user}}",
-  assistantPrefix: "{{char}}",
-  noTransTag: true,
-  noTransTagValue: "<|no-trans|>",
+  assistantPrefix: "AI",
   promptBlocks: DEFAULT_PROMPT_BLOCKS.map((b) => ({ ...b })),
   megaPromptBlocks: DEFAULT_MEGA_SUMMARY_PROMPT_BLOCKS.map((b) => ({ ...b })),
 };

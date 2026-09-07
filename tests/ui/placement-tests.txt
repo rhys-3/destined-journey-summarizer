@@ -3,7 +3,7 @@
  ui.closePromptEditor(true);await ui.settle();
  const before={data:structuredClone(data),stored:structuredClone(stored),vars:structuredClone(vars)};
  const open=id=>{ui.state.editorUnlocked=true;ui.openPromptEditor(id)};
- const move=async(id,block,before='')=>{open(id);ui.setPlacementField('block',block);ui.setPlacementField('before',before);await ui.savePromptEditor();check('保存位置 '+block,!ui.state.promptEditor.dirty&&ui.state.promptEditor.id===id);ui.closePromptEditor(true)};
+ const move=async(id,block,before='')=>{open(id);ui.setPlacementField('block',block);ui.setPlacementField('before',before);const saved=await ui.savePromptEditor();check('保存位置并关闭编辑器 '+block,!ui.state.promptEditor&&saved===id);};
  try{
   ui.state.activeTab='daily';ui.render();
   check('没有作者工作台与额外管理入口',!ui.shadow.textContent.includes('作者工作台')&&!q('[data-action="author-enter"]')&&!q('[data-tab="author"]'));
@@ -28,12 +28,14 @@
   check('界面排序同步原生位置',data.prompts.findIndex(p=>p.id===id)+1===data.prompts.findIndex(p=>p.id===anchor));
   ui.state.activeTab='style';ui.render();q('[data-action="entry-new-here"][data-block="style-extra"]').click();
   check('在板块直接新增自动填写位置',ui.state.promptEditor.draft.authorUi.block==='style-extra'&&ui.state.editorUnlocked);
-  ui.setEditorField('name','测试新增条目');ui.setEditorField('content','我的正文');await ui.savePromptEditor();const created=ui.state.promptEditor.id;
+  ui.closePromptEditor();check('自动填写默认位置不算用户修改，可直接关闭',!ui.state.promptEditor);
+  q('[data-action="entry-new-here"][data-block="style-extra"]').click();ui.setEditorField('name','测试新增条目');ui.setEditorField('content','我的正文');const created=await ui.savePromptEditor();
   check('新建默认关闭并显示在指定板块',created&&!data.prompts.find(p=>p.id===created).enabled&&ui.placementEntry(data.prompts.find(p=>p.id===created)).block==='style-extra');
-  await ui.editEntryAction('entry-copy');const copied=ui.state.promptEditor.id;
+  open(created);await ui.editEntryAction('entry-copy');const copied=ui.state.promptEditor.id;
   check('一键复制获得新 ID 且关闭',copied!==created&&data.prompts.find(p=>p.id===copied).name.includes('副本')&&!data.prompts.find(p=>p.id===copied).enabled);
   ui.setEditorField('content','未保存草稿');await ui.editEntryAction('entry-delete');check('删除不会丢掉未保存草稿',ui.state.promptEditor.dirty&&!!data.prompts.find(p=>p.id===copied));
-  await ui.savePromptEditor();await ui.editEntryAction('entry-delete');check('删除同步两份预设且没有撤销入口',!data.prompts.some(p=>p.id===copied)&&!stored.prompts.some(p=>p.id===copied)&&!q('[data-action="entry-delete-undo"]'));
+  await ui.savePromptEditor();open(copied);let deletion=ui.editEntryAction('entry-delete');check('删除使用助手前端确认弹窗',!!q('.dj-dialog'));q('.dj-dialog-actions button:last-child').click();await deletion;check('取消删除保留条目',!!data.prompts.find(p=>p.id===copied));
+  deletion=ui.editEntryAction('entry-delete');q('.dj-dialog-actions button:first-child').click();await deletion;check('删除同步两份预设且没有撤销入口',!data.prompts.some(p=>p.id===copied)&&!stored.prompts.some(p=>p.id===copied)&&!q('[data-action="entry-delete-undo"]'));
   open(ui.IDS.sceneInfo);await ui.editEntryAction('entry-delete');check('核心删除依赖保护',!!data.prompts.find(p=>p.id===ui.IDS.sceneInfo)&&ui.state.promptEditor.message.includes('依赖'));ui.closePromptEditor(true);
   open(created);ui.setPlacementField('block','content-extra');const saved=structuredClone(stored);window.failWrite='in_use';await ui.savePromptEditor();check('位置保存失败回滚并保留草稿',JSON.stringify(stored)===JSON.stringify(saved)&&ui.state.promptEditor.dirty);ui.closePromptEditor(true);
   open(created);ui.setPlacementField('before','missing-placement-anchor');await ui.savePromptEditor();check('过期位置目标会阻止保存',ui.state.promptEditor.dirty);ui.closePromptEditor(true);

@@ -197,6 +197,7 @@ export function createPlacement(ctx) {
     ctx.setEditorField('authorUi',{...editor.draft.authorUi,[field]:value,...(field==='block'?{before:''}:{})});
     editor.placementRequested=true;
     if(!editor.id)editor.draft.ordinal=nativePlacementIndex(ctx.state.preset,editor.draft.authorUi.block,editor.draft.authorUi.before,'')+1;
+    editor.dirty=JSON.stringify(editor.draft)!==JSON.stringify(editor.initialDraft??editor.base);
     ctx.renderStyleEditorLayer();
   }
 
@@ -272,7 +273,8 @@ export function createPlacement(ctx) {
     if(!editor||!ctx.state.editorUnlocked||editor.saving||editor.contextChanged)return;
     if(editor.dirty){editor.message='请先保存修改，再'+(action==='entry-copy'?'复制':'删除')+'。';return ctx.renderStyleEditorLayer();}
     if(action==='entry-delete'&&authorDependency(ctx.findEditorPrompt(ctx.state.preset,editor.id))){editor.message=authorDependency(ctx.findEditorPrompt(ctx.state.preset,editor.id));return ctx.renderStyleEditorLayer();}
-    if(action==='entry-delete'&&!window.parent.confirm('删除这个条目？'))return;
+    if(action==='entry-delete'&&!await ctx.dialogs.confirm('删除这个条目？','删除条目'))return;
+    if(ctx.state.promptEditor!==editor||editor.dirty||editor.saving||editor.contextChanged||!ctx.state.editorUnlocked)return;
     editor.saving=true;ctx.renderStyleEditorLayer();
     const presetName=editor.presetName,id=editor.id;let newId='';
     const task=ctx.saveChain.then(async()=>{

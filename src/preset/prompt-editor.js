@@ -12,12 +12,17 @@ export function createPromptEditor(ctx) {
       position: ctx.clone(prompt.position ?? { type: 'relative' }), included: index >= 0, ordinal: index >= 0 ? index + 1 : preset.prompts.length + 1, authorUi: ctx.placementSnapshot(preset,id) };
   }
 
-  function openPromptEditor(id = '') {
+  function openPromptEditor(id = '', { block } = {}) {
     ctx.refreshPreset(false);
     const base = id ? editorSnapshot(ctx.state.preset, id) : { name: '⚙️ 新条目', content: '', role: 'system', enabled: false, position: { type: 'relative' }, included: true, ordinal: ctx.state.preset.prompts.length + 1, authorUi: {block:'unclassified',before:''} };
     if (!base || (!id && !ctx.state.editorUnlocked)) return;
     ctx.state.promptEditor = { id, presetName: getLoadedPresetName(), base, draft: ctx.clone(base), order: ctx.state.preset.prompts.map(p => p.id), dirty: false, saving: false, message: '', contextChanged: false };
     ctx.state.promptEditor.authorLayout = JSON.stringify(ctx.state.preset.extensions?.destined_author ?? null);
+    if (!id && block) {
+      ctx.setPlacementField('block',block);
+      ctx.state.promptEditor.initialDraft=ctx.clone(ctx.state.promptEditor.draft);
+      ctx.state.promptEditor.dirty=false;
+    }
     ctx.state.styleEditor = null;
     ctx.renderStyleEditorLayer();
     queueMicrotask(() => ctx.shadow.querySelector('[data-action="prompt-close"]')?.focus());
@@ -48,7 +53,7 @@ export function createPromptEditor(ctx) {
     if (field === 'positionType') editor.draft.position = value === 'in_chat' ? { type: 'in_chat', depth: 4, order: 100 } : { type: 'relative' };
     else if (field === 'depth' || field === 'order') editor.draft.position[field] = value;
     else editor.draft[field] = value;
-    editor.dirty = JSON.stringify(editor.draft) !== JSON.stringify(editor.base);
+    editor.dirty = JSON.stringify(editor.draft) !== JSON.stringify(editor.initialDraft ?? editor.base);
     editor.confirmReload = false;
     editor.message = '';
   }
@@ -142,7 +147,11 @@ export function createPromptEditor(ctx) {
       editor.authorLayout = JSON.stringify(ctx.state.preset.extensions?.destined_author ?? null);
     });
     ctx.saveChain = task.catch(() => {});
-    try { await ctx.trackPresetOperation(task); }
+    try {
+      await ctx.trackPresetOperation(task);
+      if (ctx.state.promptEditor === editor) ctx.state.promptEditor = null;
+      return editor.id;
+    }
     catch (error) { editor.message = error instanceof Error ? error.message : String(error); }
     finally { editor.saving = false; ctx.renderActiveContent(true); }
   }

@@ -16,8 +16,7 @@
   check('条目列表打开后直接可编辑，无二次解锁',!q('[data-field="content"]').readOnly&&!q('[data-action="editor-unlock"]'));
   ui.closePromptEditor(true);ui.state.activeTab='style';ui.render();
   const members=ui.placementMembers('style-extra'),tail=members.at(-1).id,count=data.prompts.length;
-  q('[data-action="entry-new-here"][data-block="style-extra"]').click();ui.setEditorField('name','前端新加的功能');ui.setEditorField('content','正文');await ui.savePromptEditor();
-  const created=ui.state.promptEditor.id;
+  q('[data-action="entry-new-here"][data-block="style-extra"]').click();ui.setEditorField('name','前端新加的功能');ui.setEditorField('content','正文');const created=await ui.savePromptEditor();
   check('板块新增只增加一个条目，没有分隔条目',data.prompts.length===count+1);
   check('前端新增插在原生同板块最后一项之后',data.prompts.findIndex(p=>p.id===created)===data.prompts.findIndex(p=>p.id===tail)+1);
   check('新增同时保存当前与持久预设',stored.prompts.findIndex(p=>p.id===created)===data.prompts.findIndex(p=>p.id===created));

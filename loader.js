@@ -4,7 +4,7 @@ Required Notice: Licensing scope and historical/third-party exceptions: https://
 License: https://spdx.org/licenses/PolyForm-Noncommercial-1.0.0.html
 */
 // Paste this loader into the existing 命定预设助手 script (preserve its UUID and variables).
-const version = '3.0.1';
+const version = '3.1.0';
 const url = `https://cdn.jsdelivr.net/gh/rhys-3/destined-journey-assistant@v${version}/dist/destined-journey-assistant.js`;
 let loading = false;
 let attempt = 0;

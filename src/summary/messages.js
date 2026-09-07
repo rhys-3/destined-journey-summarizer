@@ -32,6 +32,7 @@ const getRawMessages = errorCatched(async (startFloor, endFloor) => {
     role: m.role,
     name: m.name,
     message: m.message,
+    swipe_id: m.swipe_id ?? null,
   }));
 });
 
@@ -48,8 +49,8 @@ const extractTagContent = (text, tagNames) => {
     const tagClean = tag.trim();
     if (!tagClean) continue;
     const regex = new RegExp(
-      `<${escapeRegex(tagClean)}>(.*?)</${escapeRegex(tagClean)}>`,
-      "gs",
+      `<${escapeRegex(tagClean)}(?:\\s[^>]*)?>(.*?)</${escapeRegex(tagClean)}\\s*>`,
+      "gis",
     );
     let match;
     while ((match = regex.exec(text)) !== null) {
@@ -67,23 +68,15 @@ const excludeTagContent = (text, tagNames) => {
     const tagClean = tag.trim();
     if (!tagClean) continue;
     const escapedTag = escapeRegex(tagClean);
-    const closingTagStr = `</${tagClean}>`;
-    let closingIdx = result.indexOf(closingTagStr);
-    while (closingIdx !== -1) {
-      const before = result.substring(0, closingIdx);
-      const openRegex = new RegExp(`<${escapedTag}(?:[\\s>])`, "i");
-      if (!openRegex.test(before)) {
-        result = result.substring(closingIdx + closingTagStr.length);
-        closingIdx = result.indexOf(closingTagStr);
-      } else {
-        break;
-      }
+    const pattern=new RegExp(`<\\/?${escapedTag}(?=[\\s/>])[^>]*>`,'gi');
+    let depth=0,start=0,kept=0,filtered='',match;
+    while((match=pattern.exec(result))){
+      const closing=match[0].startsWith('</'),selfClosing=/\/\s*>$/.test(match[0]);
+      if(!closing){if(!depth)start=match.index;if(!selfClosing)depth++;}
+      else if(depth)depth--;else continue;
+      if(!depth){filtered+=result.slice(kept,start);kept=pattern.lastIndex;}
     }
-    const pairedRegex = new RegExp(
-      `<${escapedTag}>[\\s\\S]*?</${escapedTag}>`,
-      "g",
-    );
-    result = result.replace(pairedRegex, "");
+    result=filtered+result.slice(kept,depth?start:result.length);
   }
   return result.trim();
 };
@@ -105,11 +98,11 @@ const processMessagesByTags = (
     if (excludeHtmlComments) {
       content = removeHtmlComments(content);
     }
-    if (excludeTags && excludeTags.length > 0) {
-      content = excludeTagContent(content, excludeTags);
-    }
-    if (includeTags && includeTags.length > 0) {
+    if (msg.role !== 'user' && includeTags && includeTags.length > 0) {
       content = extractTagContent(content, includeTags);
+    }
+    if (msg.role !== 'user' && excludeTags && excludeTags.length > 0) {
+      content = excludeTagContent(content, excludeTags);
     }
     if (!content.trim()) continue;
     results.push({
@@ -125,15 +118,16 @@ const processMessagesByTags = (
 const messagesToMergedText = (
   processedMessages,
   userPrefix = "{{user}}",
-  assistantPrefix = "{{char}}",
+  assistantPrefix = "AI",
 ) => {
   const resolvedUserPrefix = replaceMacros(userPrefix);
   const resolvedAssistantPrefix = replaceMacros(assistantPrefix);
   const lines = [];
   for (const msg of processedMessages) {
-    const prefix =
-      msg.role === "user" ? resolvedUserPrefix : resolvedAssistantPrefix;
-    lines.push(`${prefix}:\n${msg.content}`);
+    const label = msg.role === 'user'
+      ? `用户输入（意图，未必实现） · ${resolvedUserPrefix}`
+      : msg.role === 'assistant' ? `${msg.id === 0 ? '开局 · ' : ''}AI 正文（实际剧情）` + (resolvedAssistantPrefix ? ` · ${resolvedAssistantPrefix}` : '') : '系统消息（补充材料）';
+    lines.push(`[第 ${msg.id} 楼 · ${label}]\n${msg.content}`);
   }
   return lines.join("\n\n");
 };

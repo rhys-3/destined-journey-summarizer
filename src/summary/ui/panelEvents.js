@@ -1,5 +1,21 @@
+import { bindPromptTools, collectCustomMacros } from './promptTools.js';
+import { bindTagEditors, readTagEditor } from './tagEditor.js';
+import { bindFloorBrowser, refreshFloorBrowser } from './floorBrowser.js';
+import { bindBatchSettings } from './batchSettings.js';
+import { applyBusyRules, refreshTaskWidget } from './taskView.js';
+import { isBusy, assertRecordWritable } from '../../platform/lifecycle.js';
+import { parseMegaSummaryEntryName } from '../utils.js';
+import { getMegaSummaryMapping } from '../storage.js';
+import { upsertMegaSummaryEntry, deleteBoundSummaryBook, deleteMegaSummaryEntry } from '../worldbook.js';
+import { reconcileChatBinding } from '../worldbook.js';
+import { feedback } from '../feedback.js';
+import { safeErrorDetails } from '../errorHandler.js';
+import { MACROS } from '../macros.js';
+import { allFloorMessages, setManualFloorVisibility, setManualFloorVisibilityByIds, setFloorVisibilityAutomation } from '../visibility.js';
+import { getCoverage } from '../worldbook.js';
+import { renderVisibilityInfo, refreshVisibilityControls } from './visibilityView.js';
 import { BLOCK_TYPES, generateBlockId, DEFAULT_PROMPT_BLOCKS, DEFAULT_MEGA_SUMMARY_PROMPT_BLOCKS } from '../config.js';
-import { clampInt, escapeHtml, parseSummaryEntryName, makeMegaSummaryEntryName, parseTagString } from '../utils.js';
+import { clampInt, escapeHtml, parseSummaryEntryName, makeMegaSummaryEntryName } from '../utils.js';
 import { getKeyForUrl, getSettings, updateSettings, resetSettings, getMegaSummaryMap, deleteMegaSummaryMapping } from '../storage.js';
 import { fetchModelList } from '../api.js';
 import { generateDefaultWorldbookName, getActiveWorldbookName, isChatWorldbookBound, bindWorldbookToChat, unbindWorldbookFromChat, migrateWorldbookEntries, getWorldbookEntriesSafe, applySummarizedFloorsVisibility, upsertSummaryEntryByName, deleteSummaryEntry, getAllSummaryEntriesForDisplay, restoreMegaSummaryToSummaries, deactivateMegaSummaryEntry, activateMegaSummaryEntry, getAllMegaSummaryEntriesForDisplay } from '../worldbook.js';
@@ -9,6 +25,7 @@ import { renderEntryList, renderMegaEntryList, renderStatusInfo } from './render
 import { getHost, runAction, captureContext, checkContext, SillyTavern, setChatMessages } from '../../platform/lifecycle.js';
 import { setSummaryEntryEnabled } from '../worldbook.js';
 const actionListener = fn => (...args) => runAction(() => fn(...args));
+const uiListener = fn => async (...args) => { const token=captureContext(); try { const value=await fn(...args);checkContext(token);return value; } catch(error) {if(error.name!=='AbortError')getHost().status(safeErrorDetails(error,[getSettings().customApiKey]),'error');} };
 let _panelEl = null;
 const showSettingsPopup = () => getHost().remount();
 // ---- 设置收集 ----
@@ -19,61 +36,40 @@ const collectBlocksFromPanel = (
 ) => {
   const container = overlay.querySelector(containerId);
   if (!container) return [];
-  const blockEls = container.querySelectorAll(".sa-block");
-  const blocks = [];
-  blockEls.forEach((el) => {
-    const id = el.getAttribute("data-block-id");
-    if (!id) return;
-    const enableCb = el.querySelector(`[data-block-enable="${id}"]`);
-    const roleSelect = el.querySelector(`#sa-block-role-${id}`);
-    const contentArea = el.querySelector(`[data-block-content="${id}"]`);
-    const leadTextInput = el.querySelector(`[data-block-lead-text="${id}"]`);
-    const nameEl = el.querySelector(".sa-block-name");
-    const typeBadge = el.querySelector(".sa-block-type-badge");
-    let type = BLOCK_TYPES.PROMPT;
-    const badgeText = typeBadge?.textContent?.trim();
-    if (badgeText === "内置") type = BLOCK_TYPES.BUILTIN_GROUP;
-    else if (badgeText === "总结") type = BLOCK_TYPES.OLD_SUMMARY;
-    else if (badgeText === "消息") type = BLOCK_TYPES.CHAT_MESSAGES;
-    const block = {
-      id,
-      type,
-      name: nameEl?.textContent?.trim() || id,
-      enabled: enableCb ? enableCb.checked : true,
-    };
-    if (roleSelect) block.role = roleSelect.value;
-    if (contentArea) block.content = contentArea.value;
-    if (leadTextInput) block.leadText = leadTextInput.value;
-    blocks.push(block);
-  });
-  return blocks;
+  return [...container.querySelectorAll('.sa-block')].map(row=>({...JSON.parse(row.dataset.block),enabled:row.querySelector('[data-block-enable]').checked}));
 };
 
 const collectSettingsFromPanel = (overlay) => {
   const val = (id) => overlay.querySelector(`#${id}`)?.value ?? "";
   const checked = (id) => overlay.querySelector(`#${id}`)?.checked ?? false;
   return {
+    ...getSettings(),
+    batchFloorCount: clampInt(val('sa-batch-count'),1,999),
+    batchPreset: val('sa-batch-preset'),
+    parallelBatches: checked('sa-parallel-batches'),
+    batchConcurrency: clampInt(val('sa-batch-concurrency'),1,8),
+    autoMegaSummary: checked('sa-auto-mega'),
+    megaTriggerCount: clampInt(val('sa-mega-trigger'),3,999),
+    megaBatchCount: clampInt(val('sa-mega-batch'),2,998),
+    customMacros: collectCustomMacros(overlay),
     enabled: checked("sa-enabled"),
     customApiSource: getSettings().customApiSource,
-    triggerFloorCount: clampInt(val("sa-trigger-count"), 10, 999),
+    triggerFloorCount: clampInt(val("sa-trigger-count"), 1, 999),
     keepFloorCount: clampInt(val("sa-keep-count"), 1, 999),
     includeOldSummary: checked("sa-include-old-summary"),
     autoTriggerConfirm: checked("sa-auto-confirm"),
-    autoHideSummarizedFloors: checked("sa-auto-hide-summarized"),
-    noTransTag: checked("sa-no-trans-tag"),
-    noTransTagValue: val("sa-no-trans-tag-value") || "<|no-trans|>",
     userPrefix: val("sa-user-prefix") || "{{user}}",
-    assistantPrefix: val("sa-assistant-prefix") || "{{char}}",
+    assistantPrefix: val("sa-assistant-prefix"),
     apiMode:
       overlay.querySelector('input[name="sa-api-mode"]:checked')?.value ||
       "tavern",
     customApiUrl: val("sa-api-url"),
     customApiKey: val("sa-api-key"),
-    customApiModel: val("sa-api-model"),
-    temperature: val("sa-temperature") || "same_as_preset",
-    maxTokens: val("sa-max-tokens") || "same_as_preset",
-    includeTags: parseTagString(val("sa-include-tags")),
-    excludeTags: parseTagString(val("sa-exclude-tags")),
+    customApiModel: val('sa-api-model-manual') || val('sa-api-model'),
+    temperature: val('sa-temperature-mode')==='follow' ? 'same_as_preset' : val('sa-temperature'),
+    maxTokens: val('sa-max-tokens-mode')==='follow' ? 'same_as_preset' : val('sa-max-tokens'),
+    includeTags: readTagEditor(overlay,'includeTags'),
+    excludeTags: readTagEditor(overlay,'excludeTags'),
     excludeHtmlComments: checked("sa-exclude-html-comments"),
     promptBlocks: collectBlocksFromPanel(overlay, "#sa-blocks-container"),
     megaPromptBlocks: collectBlocksFromPanel(
@@ -116,7 +112,7 @@ const addNewBlock = async (overlay, containerId = "#sa-blocks-container") => {
     id: generateBlockId(),
     type: BLOCK_TYPES.PROMPT,
     name: result.trim(),
-    role: "system",
+    role: "user",
     content: "",
     enabled: true,
   });
@@ -144,6 +140,7 @@ const resetBlocks = async (
   containerId = "#sa-blocks-container",
   defaultBlocks = DEFAULT_PROMPT_BLOCKS,
 ) => {
+  assertRecordWritable();
   const cfm = await SillyTavern.callGenericPopup(
     "确定要重置所有提示词板块为默认值吗？",
     SillyTavern.POPUP_TYPE.CONFIRM,
@@ -151,29 +148,30 @@ const resetBlocks = async (
   if (cfm !== SillyTavern.POPUP_RESULT.AFFIRMATIVE) return;
   const defaults = defaultBlocks.map((b) => ({ ...b }));
   rerenderBlocks(overlay, defaults, containerId);
-  toastr.success("提示词板块已重置");
+  feedback.success("提示词板块已重置");
 };
 
 const viewEditEntry = async (overlay, entryName) => {
   const entries = await getWorldbookEntriesSafe();
   const entry = entries.find((e) => e && e.name === entryName);
   if (!entry) {
-    toastr.error(`未找到条目: ${entryName}`);
+    feedback.error(`未找到条目: ${entryName}`);
     return;
   }
+  if (isBusy()) return getHost().viewText(entryName,entry.content || '');
   const result = await SillyTavern.callGenericPopup(
     `查看/编辑条目「${escapeHtml(entryName)}」：`,
     SillyTavern.POPUP_TYPE.INPUT,
     entry.content || "",
-    { rows: 15, wide: true, okButton: "保存修改", cancelButton: "取消" },
+    { rows: 15, wide: true, recordWrite: true, okButton: "保存修改", cancelButton: "取消" },
   );
   if (
     result === SillyTavern.POPUP_RESULT.CANCELLED ||
     typeof result !== "string"
   )
     return;
-  await upsertSummaryEntryByName(entryName, result);
-  toastr.success(`已保存条目: ${entryName}`);
+  await runAction(async()=>{assertRecordWritable();if(parseMegaSummaryEntryName(entryName))await upsertMegaSummaryEntry(entryName,result,await getMegaSummaryMapping(entryName),{preserveDisabled:true});else await upsertSummaryEntryByName(entryName,result);});
+  feedback.success(`已保存条目: ${entryName}`);
   await refreshEntryList(overlay);
   await refreshStatus(overlay);
 };
@@ -185,9 +183,9 @@ const bindBlockEventsForContainer = (overlay, containerId, defaultBlocks) => {
   if (!container || container._blockEventsBound) return;
   container._blockEventsBound = true;
 
-  container.addEventListener("click", actionListener(async (e) => {
+  container.addEventListener("click", uiListener(async (e) => {
     const target = e.target;
-    if (target.closest(".sa-block-enable") || target.tagName === "INPUT")
+    if (target.closest(".sa-block-enable") || ["INPUT","TEXTAREA","SELECT"].includes(target.tagName))
       return;
     if (
       target.closest("[data-action-add-block]") ||
@@ -214,23 +212,29 @@ const bindBlockEventsForContainer = (overlay, containerId, defaultBlocks) => {
       );
       return;
     }
-    const toggleEl = target.closest("[data-block-toggle]");
-    if (toggleEl) {
-      const blockId = toggleEl.getAttribute("data-block-toggle");
-      const body = container.querySelector(`[data-block-body="${blockId}"]`);
-      toggleEl.classList.toggle("collapsed");
-      body.classList.toggle("collapsed");
+    const editEl=target.closest('[data-block-edit]');
+    if(editEl){
+      const blocks=collectBlocksFromPanel(overlay,containerId),block=blocks.find(item=>item.id===editEl.dataset.blockEdit);
+      const value=await getHost().form({title:'编辑总结条目',message:'修改在下次任务生效。',fields:[{name:'name',label:'条目名称',value:block.name},{name:'role',label:'角色',type:'select',value:block.role,options:['system','user','assistant'].map(role=>[role,role])},{name:'content',label:'提示词内容',type:'textarea',value:block.content,macros:[...MACROS,...collectCustomMacros(overlay).map(item=>[item.name,'自定义 · '+item.name])]}],choices:[['保存','__form__'],['删除条目','__delete__'],['取消',null]],validate:value=>value.name.trim()?'':'请填写条目名称。'});
+      if(value==='__delete__')return deleteBlock(overlay,block.id,containerId);
+      if(value){Object.assign(block,value,{name:value.name.trim()});rerenderBlocks(overlay,blocks,containerId);}
     }
   }));
-
-  container.addEventListener("change", (e) => {
-    const enableEl = e.target.closest("[data-block-enable]");
-    if (enableEl) {
-      const blockId = enableEl.getAttribute("data-block-enable");
-      const blockEl = container.querySelector(`[data-block-id="${blockId}"]`);
-      if (blockEl)
-        blockEl.classList.toggle("sa-block-disabled", !enableEl.checked);
+  container.addEventListener('keydown',event=>{
+    if(!event.altKey||!['ArrowUp','ArrowDown'].includes(event.key))return;
+    const row=event.target.closest('.sa-block');if(!row)return;event.preventDefault();
+    const blocks=collectBlocksFromPanel(overlay,containerId),index=blocks.findIndex(block=>block.id===row.dataset.blockId),next=index+(event.key==='ArrowUp'?-1:1);
+    if(next<0||next>=blocks.length)return;[blocks[index],blocks[next]]=[blocks[next],blocks[index]];rerenderBlocks(overlay,blocks,containerId);container.querySelectorAll('.sa-block-drag')[next].focus({preventScroll:true});
+  });
+  container.addEventListener('change',event=>{
+    const toggle=event.target.closest('[data-block-enable]');if(!toggle)return;
+    const blocks=collectBlocksFromPanel(overlay,containerId),current=blocks.find(block=>block.id===toggle.dataset.blockEnable);
+    if(current.choiceGroup){
+      if(current.enabled){for(const block of blocks)if(block!==current&&block.choiceGroup===current.choiceGroup)block.enabled=false;}
+      else if(current.choiceGroup==='tail'){const other=blocks.find(block=>block!==current&&block.choiceGroup==='tail');if(other)other.enabled=true;}
     }
+    for(const row of container.querySelectorAll('.sa-block')){const block=blocks.find(item=>item.id===row.dataset.blockId);row.querySelector('[data-block-enable]').checked=block.enabled;row.dataset.block=JSON.stringify(block);row.classList.toggle('sa-block-disabled',!block.enabled);}
+    overlay.dispatchEvent(new Event('summary-blocks-changed'));
   });
 
   // 桌面端拖拽排序
@@ -429,7 +433,7 @@ const handleEntryAction = async (overlay, action, entryName) => {
       );
       if (cfm !== SillyTavern.POPUP_RESULT.AFFIRMATIVE) return;
       await deleteSummaryEntry(entryName);
-      toastr.success(`已删除条目 "${entryName}"`);
+      feedback.success(`已删除条目 "${entryName}"`);
       await refreshEntryList(overlay);
       await refreshStatus(overlay);
       break;
@@ -464,17 +468,6 @@ const refreshEntryList = async (panel, enableSelection = false) => {
       if (Array.isArray(summaryNames)) {
         summaryNames.forEach((name) => usedInMega.add(name));
       }
-    }
-
-    // 异步清理孤立的 mapping（不阻塞 UI）
-    if (needCleanup) {
-      (async () => {
-        for (const megaName of Object.keys(megaMap)) {
-          if (!existingMegaNames.has(megaName)) {
-            await deleteMegaSummaryMapping(megaName);
-          }
-        }
-      })();
     }
 
     // 找到第一个未被大总结的有效条目的索引
@@ -525,10 +518,12 @@ const refreshEntryList = async (panel, enableSelection = false) => {
       return { ...e, selectable: enableSelection && canSelect };
     });
 
-    el.innerHTML = renderEntryList(entries, enableSelection);
+    const renderKey=JSON.stringify([entries,enableSelection]);
+    if(el._renderKey===renderKey){applyBusyRules(panel);return;}
+    el._renderKey=renderKey;el.innerHTML = renderEntryList(entries, enableSelection);
     el.querySelectorAll("button[data-action]").forEach((btn) => {
       btn.addEventListener("click", () => {
-        runAction(() => handleEntryAction(panel, btn.dataset.action, btn.dataset.name));
+        (btn.dataset.action==='view-edit'?uiListener:actionListener)(()=>handleEntryAction(panel,btn.dataset.action,btn.dataset.name))();
       });
     });
 
@@ -663,11 +658,11 @@ const handleMegaEntryAction = async (overlay, action, entryName) => {
     case "delete-mega": {
       const cfm = await SillyTavern.callGenericPopup(
         `确定要删除大总结条目「${escapeHtml(entryName)}」吗？\n\n` +
-          `删除后将恢复该大总结包含的原始总结条目。`,
+          `删除后恢复本助手隐藏且失去记忆覆盖的原文；该批次不会自动重建。`,
         SillyTavern.POPUP_TYPE.CONFIRM,
       );
       if (cfm !== SillyTavern.POPUP_RESULT.AFFIRMATIVE) return;
-      await restoreMegaSummaryToSummaries(entryName);
+      await deleteMegaSummaryEntry(entryName);
       await refreshMegaEntryList(overlay);
       await refreshEntryList(overlay);
       await refreshStatus(overlay);
@@ -681,10 +676,11 @@ const refreshMegaEntryList = async (panel) => {
   if (!el) return;
   try {
     const entries = await getAllMegaSummaryEntriesForDisplay();
+    const renderKey=JSON.stringify(entries);if(el._renderKey===renderKey){applyBusyRules(panel);return;}el._renderKey=renderKey;
     el.innerHTML = renderMegaEntryList(entries);
     el.querySelectorAll("button[data-action]").forEach((btn) => {
       btn.addEventListener("click", () => {
-        runAction(() => handleMegaEntryAction(panel, btn.dataset.action, btn.dataset.name));
+        (btn.dataset.action==='view-edit-mega'?uiListener:actionListener)(()=>handleMegaEntryAction(panel,btn.dataset.action,btn.dataset.name))();
       });
     });
   } catch (err) {
@@ -696,7 +692,23 @@ const refreshStatus = async (panel) => {
   const el = panel.querySelector("#sa-status-info");
   if (!el) return;
   try {
+    const expanded = el.querySelector('[data-coverage-details]')?.open;
     el.innerHTML = await renderStatusInfo();
+    if (expanded) el.querySelector('[data-coverage-details]').open = true;
+    const visibility = panel.querySelector('#sa-visibility-info');
+    if (visibility) {
+      const expandedFloors=visibility.querySelector('[data-floor-details]')?.open;
+      const scroll=visibility.querySelector('.sa-floor-table-wrap')?.scrollTop ?? 0;
+      const {floors}=await getCoverage();
+      visibility.innerHTML=renderVisibilityInfo(floors,panel);
+      refreshVisibilityControls(panel,floors);
+      if(expandedFloors) visibility.querySelector('[data-floor-details]').open=true;
+      refreshFloorBrowser(panel);
+      const table=visibility.querySelector('.sa-floor-table-wrap');if(table)table.scrollTop=scroll;
+      applyBusyRules(panel);
+    }
+    const hint=panel.querySelector('[data-binding-hint]');
+    if(hint) hint.textContent=isChatWorldbookBound()?`本聊天总结书：${getActiveWorldbookName()}`:getVariables({type:'chat'})?.summary_assistant_binding_paused?'已主动解绑；重新绑定后可继续总结。':'未绑定世界书：首次总结时将自动创建并绑定本聊天的独立总结书。';
   } catch (err) {
     el.innerHTML = `加载状态失败: ${err.message}`;
   }
@@ -715,7 +727,16 @@ const bindPanelEvents = (overlay, initialSettings) => {
       overlay
         .querySelector(`.sa-tab-pane[data-pane="${tabName}"]`)
         .classList.add("active");
+      if (tabName === 'worldbook') overlay._refreshWorldbooks?.();
+      if (tabName === 'status') refreshVisibilityControls(overlay);
     });
+  });
+  overlay.querySelectorAll('[data-prompt-page]').forEach(button => button.addEventListener('click', () => {
+    for (const item of overlay.querySelectorAll('[data-prompt-page]')) item.classList.toggle('active', item === button);
+    for (const pane of overlay.querySelectorAll('[data-prompt-pane]')) pane.classList.toggle('active', pane.dataset.promptPane === button.dataset.promptPage);
+  }));
+  overlay.addEventListener('change', event => {
+    if (event.target.matches('[id^="sa-block-role-"]')) event.target.closest('.sa-block').querySelector('[data-block-role-badge]').textContent = event.target.value;
   });
 
   // 二级导航切换
@@ -768,108 +789,102 @@ const bindPanelEvents = (overlay, initialSettings) => {
   // 获取模型列表
   overlay
     .querySelector("#sa-fetch-models")
-    .addEventListener("click", actionListener(async () => {
+    .addEventListener("click", uiListener(async () => {
       const url = overlay.querySelector("#sa-api-url").value.trim();
       const key = overlay.querySelector("#sa-api-key").value.trim();
       if (!url) {
-        toastr.warning("请先填写API地址");
+        feedback.warning("请先填写API地址");
         return;
       }
       try {
-        toastr.info("正在获取模型列表...");
+        feedback.info("正在获取模型列表...");
         const models = await fetchModelList(url, key);
         const select = overlay.querySelector("#sa-api-model");
-        select.innerHTML = "";
+        const selected=overlay.querySelector('#sa-api-model-manual').value || select.value;
+        select.innerHTML = '';
+        if(selected)select.add(new Option(selected,selected));
         if (models && models.length > 0) {
-          models.forEach((m) => select.add(new Option(m, m)));
-          toastr.success(`获取到 ${models.length} 个模型`);
-          // 自动选择第一个模型并触发自动保存
-          if (select.value) {
-            autoSave();
-          }
+          models.filter(m=>m!==selected).forEach((m) => select.add(new Option(m, m)));
+          select.value=selected||'';
+          feedback.success(`获取到 ${models.length} 个模型`);
+          if(!selected)select.insertBefore(new Option('请选择模型',''),select.firstChild);select.value=selected;
         } else {
           select.innerHTML = '<option value="">未获取到模型</option>';
-          toastr.warning("未获取到任何模型");
+          feedback.warning("未获取到任何模型");
         }
       } catch (err) {
-        toastr.error(`获取模型列表失败: ${err.message}`);
-        console.error("获取模型列表详细错误:", err);
+        feedback.error(`获取模型列表失败: ${err.message}`);
+
       }
     }));
 
   // ---- 楼层隐藏/显示管理 ----
-  const CHUNK = 200;
-  const batchSetHidden = async (fromId, toId, hidden) => {
-    const lastId = getLastMessageId();
-    if (lastId < 0) return 0;
-    const lo = Math.max(0, Math.min(fromId, toId));
-    const hi = Math.min(lastId, Math.max(fromId, toId));
-    const msgs = getChatMessages(`${lo}-${hi}`, {
-      role: "all",
-      hide_state: "all",
-      include_swipes: false,
-    });
-    const updates = [];
-    for (const msg of msgs) {
-      const id = msg?.message_id;
-      if (!Number.isFinite(id)) continue;
-      if (!!msg?.is_hidden !== hidden) {
-        updates.push({ message_id: id, is_hidden: hidden });
-      }
-    }
-    if (updates.length === 0) return 0;
-    for (let i = 0; i < updates.length; i += CHUNK) {
-      const isLast = i + CHUNK >= updates.length;
-      await setChatMessages(updates.slice(i, i + CHUNK), {
-        refresh: isLast ? "all" : "none",
-      });
-    }
-    return updates.length;
-  };
+  bindFloorBrowser(overlay);
+  const batchSetHidden=(from,to,hidden)=>setManualFloorVisibility(from,to,hidden,overlay.querySelector('#sa-vis-role').value);
+  overlay.querySelector('#sa-vis-refresh').onclick=uiListener(()=>refreshStatus(overlay));
+  overlay.querySelector('#sa-visibility-info').addEventListener('click',uiListener(async event=>{
+    const button=event.target.closest('[data-floor-view],[data-floor-toggle]');if(!button)return;
+    const from=Number(button.dataset.from),to=Number(button.dataset.to);
+    if(button.hasAttribute('data-floor-view')) {
+      const messages=getChatMessages(`${from}-${to}`,{role:'all',hide_state:'all',include_swipes:false});
+      await getHost().viewText(`${from===to?from:from+'—'+to} 楼原文`,messages.map(message=>`[第 ${message.message_id} 楼 · ${message.role==='user'?'用户输入':message.role==='assistant'?'AI 输出':'系统消息'} · ${message.is_hidden?'隐藏':'显示'}]\n${message.message}`).join('\n\n'));
+    } else await runAction(async()=>{const count=await setManualFloorVisibility(from,to,button.dataset.hide==='true');feedback.success(`已${button.dataset.hide==='true'?'隐藏':'显示'} ${count} 楼`);await refreshStatus(overlay);});
+  }));
 
   overlay
     .querySelector("#sa-vis-hide-range")
     .addEventListener("click", actionListener(async () => {
-      const from = parseInt(overlay.querySelector("#sa-vis-from").value, 10);
-      const to = parseInt(overlay.querySelector("#sa-vis-to").value, 10);
+      const from = overlay.querySelector("#sa-vis-from").valueAsNumber;
+      const to = overlay.querySelector("#sa-vis-to").valueAsNumber;
       if (isNaN(from) || isNaN(to)) {
-        toastr.warning("请输入有效的楼层范围");
+        feedback.warning("请输入有效的楼层范围");
         return;
       }
       const count = await batchSetHidden(from, to, true);
-      toastr.success(`已隐藏 ${count} 条消息（${from}-${to} 楼）`);
+      feedback.success(`已隐藏 ${count} 条消息（${from}-${to} 楼）`);
       await refreshStatus(overlay);
     }));
   overlay
     .querySelector("#sa-vis-show-range")
     .addEventListener("click", actionListener(async () => {
-      const from = parseInt(overlay.querySelector("#sa-vis-from").value, 10);
-      const to = parseInt(overlay.querySelector("#sa-vis-to").value, 10);
+      const from = overlay.querySelector("#sa-vis-from").valueAsNumber;
+      const to = overlay.querySelector("#sa-vis-to").valueAsNumber;
       if (isNaN(from) || isNaN(to)) {
-        toastr.warning("请输入有效的楼层范围");
+        feedback.warning("请输入有效的楼层范围");
         return;
       }
       const count = await batchSetHidden(from, to, false);
-      toastr.success(`已显示 ${count} 条消息（${from}-${to} 楼）`);
+      feedback.success(`已显示 ${count} 条消息（${from}-${to} 楼）`);
       await refreshStatus(overlay);
     }));
   overlay
     .querySelector("#sa-vis-hide-summarized")
     .addEventListener("click", actionListener(async () => {
-      await applySummarizedFloorsVisibility();
-      toastr.success("已隐藏所有已总结楼层");
+      const {floors}=await getCoverage();
+      if(!floors.size){feedback.info('暂无已总结楼层');return;}
+      const count=await setManualFloorVisibilityByIds(floors,true);
+      feedback.success(count?`已隐藏 ${count} 楼；自动隐藏已暂停`:`已总结的 ${floors.size} 楼均已隐藏；自动隐藏已暂停`);
       await refreshStatus(overlay);
     }));
+  overlay.querySelector('#sa-vis-auto-hide').addEventListener('change',uiListener(async()=>{
+    const enabled=overlay.querySelector('#sa-vis-auto-hide').checked;
+    await runAction(async()=>{
+      setFloorVisibilityAutomation(enabled);
+      if(enabled)await applySummarizedFloorsVisibility();
+      feedback.success(enabled?'已开启按总结自动隐藏':'已暂停自动隐藏，保留当前楼层状态');
+    });
+    await refreshStatus(overlay);
+  }));
   overlay
     .querySelector("#sa-vis-show-all")
     .addEventListener("click", actionListener(async () => {
       const lastId = getLastMessageId();
       if (lastId < 0) {
-        toastr.warning("聊天为空");
+        feedback.warning("聊天为空");
         return;
       }
-      const count = await batchSetHidden(0, lastId, false);
-      toastr.success(`已显示全部 ${count} 条已隐藏消息`);
+      const count = await setManualFloorVisibility(0, lastId, false);
+      feedback.success(`已显示全部 ${count} 条已隐藏消息`);
       await refreshStatus(overlay);
     }));
 
@@ -883,28 +898,42 @@ const bindPanelEvents = (overlay, initialSettings) => {
     }
     const unbindBtn = overlay.querySelector("#sa-unbind-worldbook");
     const switchBtn = overlay.querySelector("#sa-switch-worldbook");
-    if (unbindBtn) unbindBtn.disabled = !isChatWorldbookBound();
-    if (switchBtn) switchBtn.disabled = !isChatWorldbookBound();
+    for (const button of [unbindBtn, switchBtn, overlay.querySelector('#sa-delete-worldbook'), overlay.querySelector('#sa-view-worldbook')]) {
+      if (!button) continue;
+      const disabled = !isChatWorldbookBound();
+      if (button.hasAttribute('data-task-locked')) {
+        button.dataset.wasDisabled = String(disabled);
+        button.disabled = true;
+      } else button.disabled = disabled;
+    }
   };
   const loadWbSelect = async () => {
     const select = overlay.querySelector("#sa-wb-select");
     if (!select) return;
     try {
-      const names = await getWorldbookNames();
+      const token = captureContext();
+      const names = isBusy() ? await getWorldbookNames() : await reconcileChatBinding();
+      checkContext(token);
       const currentName = getActiveWorldbookName();
+      const previous = select.value;
+      const selection = names.includes(previous) ? previous : currentName;
       select.innerHTML =
         '<option value="">-- 请选择 --</option>' +
-        names
+        names.slice().sort((a,b) => a.localeCompare(b, 'zh-CN'))
           .map(
             (n) =>
-              `<option value="${escapeHtml(n)}" ${n === currentName ? "selected" : ""}>${escapeHtml(n)}</option>`,
+              `<option value="${escapeHtml(n)}" ${n === selection ? "selected" : ""}>${escapeHtml(n)}${n === currentName ? '（当前绑定）' : ''}</option>`,
           )
           .join("");
+      refreshWbBindStatus();
     } catch (e) {
       select.innerHTML = '<option value="">-- 加载失败 --</option>';
     }
   };
   loadWbSelect();
+  overlay._refreshWorldbooks = loadWbSelect;
+  overlay.querySelector('#sa-refresh-worldbooks')?.addEventListener('click', uiListener(loadWbSelect));
+  overlay.querySelector('#sa-wb-select')?.addEventListener('focus', () => { loadWbSelect(); });
 
   overlay
     .querySelector("#sa-bind-worldbook")
@@ -920,14 +949,14 @@ const bindPanelEvents = (overlay, initialSettings) => {
           await loadWbSelect();
           await refreshEntryList(overlay);
           await refreshStatus(overlay);
-          toastr.success(`已自动创建并绑定世界书: "${autoName}"`);
+          feedback.success(`已自动创建并绑定世界书: "${autoName}"`);
         } catch (err) {
-          toastr.error(`绑定失败: ${err.message}`);
+          feedback.error(`绑定失败: ${err.message}`);
         }
         return;
       }
       if (isChatWorldbookBound() && getActiveWorldbookName() === name) {
-        toastr.info("当前聊天已绑定该世界书");
+        feedback.info("当前聊天已绑定该世界书");
         return;
       }
       try {
@@ -937,9 +966,9 @@ const bindPanelEvents = (overlay, initialSettings) => {
         overlay.querySelector("#sa-new-wb-name").value = "";
         await refreshEntryList(overlay);
         await refreshStatus(overlay);
-        toastr.success(`已绑定世界书: "${name}"`);
+        feedback.success(`已绑定世界书: "${name}"`);
       } catch (err) {
-        toastr.error(`绑定失败: ${err.message}`);
+        feedback.error(`绑定失败: ${err.message}`);
       }
     }));
 
@@ -947,7 +976,7 @@ const bindPanelEvents = (overlay, initialSettings) => {
     .querySelector("#sa-unbind-worldbook")
     ?.addEventListener("click", actionListener(async () => {
       if (!isChatWorldbookBound()) {
-        toastr.info("当前聊天未绑定世界书");
+        feedback.info("当前聊天未绑定世界书");
         return;
       }
       const currentName = getActiveWorldbookName();
@@ -961,9 +990,9 @@ const bindPanelEvents = (overlay, initialSettings) => {
         refreshWbBindStatus();
         await refreshEntryList(overlay);
         await refreshStatus(overlay);
-        toastr.success(`已解绑世界书: "${currentName}"`);
+        feedback.success(`已解绑世界书: "${currentName}"`);
       } catch (err) {
-        toastr.error(`解绑失败: ${err.message}`);
+        feedback.error(`解绑失败: ${err.message}`);
       }
     }));
 
@@ -971,19 +1000,19 @@ const bindPanelEvents = (overlay, initialSettings) => {
     .querySelector("#sa-switch-worldbook")
     ?.addEventListener("click", actionListener(async () => {
       if (!isChatWorldbookBound()) {
-        toastr.warning("当前聊天未绑定世界书，请先绑定");
+        feedback.warning("当前聊天未绑定世界书，请先绑定");
         return;
       }
       const selectVal = overlay.querySelector("#sa-wb-select")?.value?.trim();
       const inputVal = overlay.querySelector("#sa-new-wb-name")?.value?.trim();
       const newName = inputVal || selectVal;
       if (!newName) {
-        toastr.warning("请选择或输入目标世界书名称");
+        feedback.warning("请选择或输入目标世界书名称");
         return;
       }
       const oldName = getActiveWorldbookName();
       if (newName === oldName) {
-        toastr.info("目标世界书与当前相同，无需迁移");
+        feedback.info("目标世界书与当前相同，无需迁移");
         return;
       }
       const cfm = await SillyTavern.callGenericPopup(
@@ -992,16 +1021,16 @@ const bindPanelEvents = (overlay, initialSettings) => {
       );
       if (cfm !== SillyTavern.POPUP_RESULT.AFFIRMATIVE) return;
       try {
-        toastr.info("正在迁移世界书...");
+        feedback.info("正在迁移世界书...");
         await migrateWorldbookEntries(oldName, newName);
         refreshWbBindStatus();
         await loadWbSelect();
         overlay.querySelector("#sa-new-wb-name").value = "";
         await refreshEntryList(overlay);
         await refreshStatus(overlay);
-        toastr.success(`已迁移到世界书「${newName}」`);
+        feedback.success(`已迁移到世界书「${newName}」`);
       } catch (err) {
-        toastr.error(`迁移失败: ${err.message}`);
+        feedback.error(`迁移失败: ${err.message}`);
       }
     }));
 
@@ -1013,30 +1042,34 @@ const bindPanelEvents = (overlay, initialSettings) => {
     clearTimeout(_autoSaveTimer); _autoSaveTimer = null;
     checkContext(panelToken);
     await updateSettings(collectSettingsFromPanel(overlay));
+    refreshVisibilityControls(overlay);
+    feedback.success('总结设置已保存，下次任务生效');
   };
   overlay._dispose = () => { clearTimeout(_autoSaveTimer); _autoSaveTimer = null; };
   const autoSave = () => {
     if (_autoSaveTimer) clearTimeout(_autoSaveTimer);
+    feedback.info('总结设置待保存…');
     _autoSaveTimer = setTimeout(async () => {
       try {
         checkContext(panelToken);
         _autoSaveTimer = null;
         const newSettings = collectSettingsFromPanel(overlay);
         await updateSettings(newSettings);
-        toastr.info("设置已自动保存", "", {
-          timeOut: 1200,
-          positionClass: "toast-top-right",
-        });
+        refreshVisibilityControls(overlay);
+        feedback.success("总结设置已保存，下次任务生效");
       } catch (e) {
         getHost().status(`总结设置保存失败：${e.message}`, "error");
       }
     }, 800);
   };
   const onFieldChange = e => {
-    if (!e.target.matches('input,select,textarea') || ['sa-enabled','sa-vis-from','sa-vis-to'].includes(e.target.id)) return;
+    if(e.composedPath().some(node=>node?.matches?.('[data-task-widget],.sa-visibility-panel,.sa-tag-editor')))return;
+    if (!e.target.matches('input,select,textarea') || ['sa-enabled','sa-vis-from','sa-vis-to','sa-new-wb-name','sa-wb-select'].includes(e.target.id)) return;
     autoSave();
   };
   overlay.addEventListener("summary-blocks-changed", autoSave);
+  bindTagEditors(overlay,autoSave);
+  bindBatchSettings(overlay);
   overlay.querySelector('#sa-api-url').addEventListener('input', e => { overlay.querySelector('#sa-api-key').value = getKeyForUrl(e.target.value); });
   overlay.addEventListener('input', onFieldChange);
   overlay.addEventListener('change', onFieldChange);
@@ -1048,11 +1081,11 @@ const bindPanelEvents = (overlay, initialSettings) => {
       SillyTavern.POPUP_TYPE.CONFIRM,
     );
     if (cfm !== SillyTavern.POPUP_RESULT.AFFIRMATIVE) return;
+    await overlay._flush?.();
     await resetSettings();
     await applySummarizedFloorsVisibility();
-    overlay._flush?.();
     await showSettingsPopup();
-    toastr.success("设置已重置");
+    feedback.success("设置已重置");
   }));
 
   // ---- 手动开始总结 ----
@@ -1087,7 +1120,7 @@ const bindPanelEvents = (overlay, initialSettings) => {
     ?.addEventListener("click", actionListener(async () => {
       // 切换选择模式
       const btn = overlay.querySelector("#sa-start-mega-summary");
-      const isSelecting = btn.textContent.includes("取消");
+      const isSelecting = btn.textContent.includes("退出");
 
       if (isSelecting) {
         // 取消选择模式
@@ -1101,7 +1134,7 @@ const bindPanelEvents = (overlay, initialSettings) => {
       }
 
       // 进入选择模式
-      btn.textContent = "取消选择";
+      btn.textContent = "退出大总结选择";
       btn.classList.remove("sa-btn-primary");
       btn.classList.add("sa-btn-danger");
       await refreshEntryList(overlay, true);
@@ -1126,7 +1159,7 @@ const bindPanelEvents = (overlay, initialSettings) => {
             ".sa-entry-checkbox:checked",
           );
           if (checkboxes.length < 2) {
-            toastr.warning("请至少选择 2 个总结条目进行大总结");
+            feedback.warning("请至少选择 2 个总结条目进行大总结");
             return;
           }
 
@@ -1151,7 +1184,7 @@ const bindPanelEvents = (overlay, initialSettings) => {
           );
 
           if (!firstParsed || !lastParsed) {
-            toastr.error("选中的条目格式不正确");
+            feedback.error("选中的条目格式不正确");
             return;
           }
 
@@ -1185,10 +1218,16 @@ const bindPanelEvents = (overlay, initialSettings) => {
     }));
 
   overlay.querySelector('#sa-enabled').addEventListener('change', async e => {
-    try { await updateSettings({ enabled: e.target.checked }); panelToken = captureContext(); } catch(error) { e.target.checked = getSettings().enabled; getHost().status(error.message, 'error'); }
+    try { await updateSettings({ enabled: e.target.checked }); panelToken = captureContext(); feedback.success(e.target.checked?'自动总结已开启':'自动总结已暂停；当前任务可继续完成'); } catch(error) { e.target.checked = getSettings().enabled; getHost().status(error.message, 'error'); }
   });
   // ---- 绑定板块事件 ----
   bindBlockEvents(overlay);
+  bindPromptTools(overlay,initialSettings,{collect:collectSettingsFromPanel,rerender:rerenderBlocks});
+  refreshTaskWidget(overlay);
+  for(const id of ['sa-temperature','sa-max-tokens'])overlay.querySelector('#'+id+'-mode').addEventListener('change',event=>{overlay.querySelector('#'+id).disabled=event.target.value==='follow';});
+  overlay.querySelector('#sa-api-model').addEventListener('change',e=>{overlay.querySelector('#sa-api-model-manual').value=e.target.value;autoSave();});
+  overlay.querySelector('#sa-view-worldbook').onclick=uiListener(async()=>getHost().viewText('本聊天的总结记忆',(await getWorldbookEntriesSafe()).filter(entry=>parseSummaryEntryName(entry.name)||parseMegaSummaryEntryName(entry.name)).map(entry=>'['+entry.name+']\n'+entry.content).join('\n\n')));
+  overlay.querySelector('#sa-delete-worldbook').onclick=actionListener(async()=>{const name=getActiveWorldbookName();if(!name)return;const confirmed=await SillyTavern.callGenericPopup('确定删除本聊天的总结世界书「'+escapeHtml(name)+'」？如包含其他条目，只清理总结记录。',SillyTavern.POPUP_TYPE.CONFIRM);if(confirmed!==SillyTavern.POPUP_RESULT.AFFIRMATIVE)return;const result=await deleteBoundSummaryBook();await loadWbSelect();await refreshEntryList(overlay);await refreshMegaEntryList(overlay);await refreshStatus(overlay);feedback.success(result?.keptOtherEntries?'总结记录已清理，其他世界书条目已保留':'总结世界书已删除');});
 };
 
 export { actionListener, _panelEl, showSettingsPopup, collectBlocksFromPanel, collectSettingsFromPanel, _draggedBlockId, rerenderBlocks, addNewBlock, deleteBlock, resetBlocks, viewEditEntry, bindBlockEventsForContainer, bindBlockEvents, handleEntryAction, refreshEntryList, bindMegaSelectionLogic, updateSelectionCount, addSelectionControls, handleMegaEntryAction, refreshMegaEntryList, refreshStatus, bindPanelEvents };

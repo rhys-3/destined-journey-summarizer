@@ -171,16 +171,16 @@ export function createCustomModels(ctx) {
     const id = target.dataset.id;
     if (action === 'configuration-save-new') return ctx.saveNamedConfiguration(ctx.state.configurationName);
     if (action === 'configuration-overwrite') {
-      if (window.confirm('用当前设置覆盖这份命名配置？')) return ctx.saveNamedConfiguration('', id);
+      if (await ctx.dialogs.confirm('用当前设置覆盖这份命名配置？')) return ctx.saveNamedConfiguration('', id);
     }
     if (action === 'configuration-apply') return ctx.applyConfiguration(id);
     if (action === 'configuration-recover') return ctx.applyConfiguration('__recovery__');
     if (action === 'configuration-rename') {
       const item = ctx.configLibrary().items.find(item => item.id === id);
-      const name = window.prompt('配置名称', item?.name ?? '');
+      const name = await ctx.dialogs.prompt('配置名称', item?.name ?? '');
       if (name !== null) return ctx.renameConfiguration(id, name);
     }
-    if (action === 'configuration-delete' && window.confirm('删除这份命名配置？当前设置不会被删除。')) return ctx.deleteConfiguration(id);
+    if (action === 'configuration-delete' && await ctx.dialogs.confirm('删除这份命名配置？当前设置不会被删除。')) return ctx.deleteConfiguration(id);
     if (action === 'configuration-export') {
       const item = ctx.configLibrary().items.find(item => item.id === id);
       ctx.downloadConfiguration(ctx.exportConfigurations(id), item?.name ?? '命定配置');
@@ -190,10 +190,10 @@ export function createCustomModels(ctx) {
     if (action === 'configuration-import') ctx.shadow.querySelector('[data-action="configuration-file"]')?.click();
     if (action === 'model-add') return addCustomModel(ctx.state.modelDraft.name, ctx.state.modelDraft.tailMode, ctx.state.modelDraft.binding);
     if (action === 'model-rename') {
-      const name = window.prompt('模型名称', ctx.MODEL_ADAPTERS[id]?.label ?? '');
+      const name = await ctx.dialogs.prompt('模型名称', ctx.MODEL_ADAPTERS[id]?.label ?? '');
       if (name !== null) return renameCustomModel(id, name);
     }
-    if (action === 'model-delete' && window.confirm('删除该模型及其三个条目？已保存的配置保持不变。')) return deleteCustomModel(id);
+    if (action === 'model-delete' && await ctx.dialogs.confirm('删除该模型及其三个条目？已保存的配置保持不变。')) return deleteCustomModel(id);
   }
 
   return {

@@ -1,8 +1,11 @@
 import { errorCatched } from './errorHandler.js';
 import { CONFIG, BLOCK_TYPES, generateBlockId, DEFAULT_PROMPT_BLOCKS, DEFAULT_MEGA_SUMMARY_PROMPT_BLOCKS, DEFAULT_SETTINGS } from './config.js';
-import { getHost, setRuntimeEnabled, insertOrAssignVariables } from '../platform/lifecycle.js';
+import { getHost, setRuntimeEnabled, writeVariableKeys } from '../platform/lifecycle.js';
+import { assertRecordWritable } from '../platform/lifecycle.js';
 import { readStore, patchSummaryStore } from '../platform/store.js';
 import { summarySnapshot } from './settingsSchema.js';
+import { PRESET_PROMPTS as LEGACY_PROMPTS } from './presetDefaults.js';
+import { OUTPUT_CONTRACT, PREVIOUS_ARCHIVE_PROMPTS, PREVIOUS_COMPACT_PROMPTS, optionBlocks, PROMPT_VERSION } from './archiveDefaults.js';
 /**
  * storage.js
  * 设置的加载、保存、迁移、重置
@@ -11,8 +14,15 @@ import { summarySnapshot } from './settingsSchema.js';
 
 let _cachedSettings = null;
 
+const matchesDefaultBlocks = (actual, defaults) => {
+  if (!Array.isArray(actual) || actual.length !== defaults.length) return false;
+  // Persisted snapshots reorder object keys; compare the editable values, not JSON key order.
+  const value = (block, key) => key === 'content' ? String(block?.content ?? '').replace(/\n\{\{summary.depth\}\}/g,'') : block?.[key] ?? (key === 'role' ? 'system' : key === 'enabled' ? true : '');
+  return actual.every((block, index) => ['id','name','type','enabled','role','content','leadText','xmlTag'].every(key => value(block,key) === value(defaults[index],key)));
+};
+
 const cloneSettings = (settings) => ({
-  ...settings,
+  ...structuredClone(settings),
   includeTags: Array.isArray(settings?.includeTags)
     ? [...settings.includeTags]
     : [...DEFAULT_SETTINGS.includeTags],
@@ -28,7 +38,23 @@ const cloneSettings = (settings) => ({
 });
 
 const migrateOldSettings = (raw) => {
-  if (Array.isArray(raw.promptBlocks) && raw.promptBlocks.length > 0) return raw;
+  if(raw.behaviorVersion===undefined){
+    if(JSON.stringify(raw.excludeTags)==='["think"]')raw.excludeTags=[];
+    if(raw.megaTriggerCount===8&&raw.megaBatchCount===6){raw.megaTriggerCount=15;raw.megaBatchCount=10;}
+    raw.behaviorVersion=1;
+  }
+  if (raw.promptVersion !== 3 && raw.promptVersion !== PROMPT_VERSION) {
+    let replacedNormal = false;
+    for (const [key, defaults] of [['promptBlocks', DEFAULT_PROMPT_BLOCKS], ['megaPromptBlocks', DEFAULT_MEGA_SUMMARY_PROMPT_BLOCKS]]) {
+      if ([LEGACY_PROMPTS[key], PREVIOUS_ARCHIVE_PROMPTS[key]].some(previous => matchesDefaultBlocks(raw[key], previous))) {
+        raw[key] = structuredClone(defaults);
+        if (key === 'promptBlocks') replacedNormal = true;
+      } else if (raw.promptVersion !== 2 && Array.isArray(raw[key]) && !raw[key].some(block => block.id === 'result_contract' || block.content?.includes('{{summary.output_format}}'))) raw[key].push({ id: 'result_contract', type: 'prompt', name: '结果标签协议', enabled: true, role: 'user', content: OUTPUT_CONTRACT });
+    }
+    if (replacedNormal && (!raw.resultFormat || raw.resultFormat === 'free')) raw.resultFormat = 'legacy';
+    raw.promptVersion = 3;
+  }
+  if (Array.isArray(raw.promptBlocks)) return migrateNativeOptions(raw);
   const blocks = DEFAULT_PROMPT_BLOCKS.map((b) => ({ ...b }));
   for (const block of blocks) {
     if (block.id === 'jailbreak' && raw.jailbreakPrompt !== undefined) {
@@ -51,6 +77,7 @@ const migrateOldSettings = (raw) => {
     }
   }
   raw.promptBlocks = blocks;
+  if (raw.summaryInstruction !== undefined) raw.promptBlocks.push({ id:'summary_instruction', type:'prompt', name:'附加输出要求', enabled:true, role:raw.summaryInstructionRole || 'user', content:raw.summaryInstruction });
   delete raw.jailbreakPrompt;
   delete raw.jailbreakRole;
   delete raw.summaryRulesPrompt;
@@ -59,8 +86,34 @@ const migrateOldSettings = (raw) => {
   delete raw.chatMessagesRole;
   delete raw.summaryInstruction;
   delete raw.summaryInstructionRole;
-  return raw;
+  return migrateNativeOptions(raw);
 };
+
+function migrateNativeOptions(raw) {
+  if(raw.promptVersion!==PROMPT_VERSION){
+    for(const [key,defaults] of [['promptBlocks',DEFAULT_PROMPT_BLOCKS],['megaPromptBlocks',DEFAULT_MEGA_SUMMARY_PROMPT_BLOCKS]]){
+      if(!Array.isArray(raw[key])){raw[key]=structuredClone(defaults);continue;}
+      const untouched=matchesDefaultBlocks(raw[key],PREVIOUS_COMPACT_PROMPTS[key]);
+      const options=optionBlocks({resultFormat:raw.resultFormat??(untouched?'legacy':'free'),thinkingTemplate:raw.thinkingTemplate??'native',prefillTemplate:raw.prefillTemplate??'off'});
+      if(untouched)raw[key]=structuredClone(defaults).map(block=>options.find(option=>option.id===block.id)??block);
+      else if(!raw[key].some(block=>block.choiceGroup)){
+        const ids=new Set(raw[key].map(block=>block.id));
+        raw[key].push(...options.map(block=>ids.has(block.id)?{...block,id:generateBlockId()}:block));
+      }
+    }
+  }
+  for(const [key,defaults] of [['promptBlocks',DEFAULT_PROMPT_BLOCKS],['megaPromptBlocks',DEFAULT_MEGA_SUMMARY_PROMPT_BLOCKS]])raw[key]=(raw[key]??structuredClone(defaults)).map(block=>{
+    if(block.type===BLOCK_TYPES.PROMPT)return block;
+    let content=block.content;
+    if(block.type===BLOCK_TYPES.BUILTIN_GROUP)content??=['world_before','persona','character','personality','scenario','world_after','examples'].map(name=>'{{summary.'+name+'}}').join('\n\n');
+    if(block.type===BLOCK_TYPES.OLD_SUMMARY)content='<prior_memory>\n{{summary.history}}\n</prior_memory>';
+    if(block.type===BLOCK_TYPES.CHAT_MESSAGES){const tag=block.xmlTag||'source_material';content=(block.leadText||'')+'\n<'+tag+'>\n{{summary.material}}\n</'+tag+'>';}
+    return {...block,type:BLOCK_TYPES.PROMPT,role:block.role||'user',content:content??''};
+  });
+  raw.promptVersion=PROMPT_VERSION;
+  for(const key of ['resultFormat','thinkingTemplate','prefillTemplate','includeDepthWorldbook','noTransTag','noTransTagValue'])delete raw[key];
+  return raw;
+}
 
 const validateBlocks = (blocks, defaultBlocks = DEFAULT_PROMPT_BLOCKS) => {
   if (!Array.isArray(blocks)) return defaultBlocks.map((b) => ({ ...b }));
@@ -76,12 +129,6 @@ const validateBlocks = (blocks, defaultBlocks = DEFAULT_PROMPT_BLOCKS) => {
       return b;
     })
     .filter(Boolean);
-  const byId = new Map(normalized.map((b) => [b.id, b]));
-  for (const defaultBlock of defaultBlocks) {
-    if (!byId.has(defaultBlock.id)) {
-      normalized.push({ ...defaultBlock });
-    }
-  }
   return normalized;
 };
 
@@ -116,6 +163,7 @@ const updateSettings = async partial => {
   return settings;
 };
 const resetSettings = async () => {
+  assertRecordWritable();
   const settings = { ...structuredClone(DEFAULT_SETTINGS), enabled: getSettings().enabled, customApiKey: getKeyForUrl(DEFAULT_SETTINGS.customApiUrl) };
   await saveSettings(settings); return settings;
 };
@@ -137,7 +185,7 @@ const loadMegaSummaryMap = errorCatched(async () => {
 });
 
 const saveMegaSummaryMap = errorCatched(async (map) => {
-  insertOrAssignVariables(
+  writeVariableKeys(
     { [CONFIG.MEGA_SUMMARY_VAR_KEY]: map || {} },
     { type: 'chat' }
   );
