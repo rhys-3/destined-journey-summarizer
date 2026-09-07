@@ -26,10 +26,12 @@
 在预设的酒馆助手脚本列表中，将 **命定预设助手**（旧版名为“【命定之诗】预设设置”） 的内容替换为 [loader.js](loader.js)，保留脚本 UUID 和已有变量。标准 UUID 为 `3a01f9c2-f6e8-4754-ad75-347741051662`。加载器通过固定版本地址载入助手：
 
 ```text
-https://cdn.jsdelivr.net/gh/rhys-3/destined-journey-assistant@v3.1.0/dist/destined-journey-assistant.js
+https://cdn.jsdelivr.net/gh/rhys-3/destined-journey-assistant@v3.1.1/dist/destined-journey-assistant.js
 ```
 
 加载失败时会显示版本、原因和重试按钮。重试使用同一个版本，不会切换到开发分支。
+
+中文消息处理标签需配合命定·黄昏 Prime 1.1.1 使用。由 1.1 升级时导入新版预设，使结构条目、消息脚本与助手加载器一起更新；旧消息标签不再兼容。
 
 可用版本见 [Git 标签](https://github.com/rhys-3/destined-journey-assistant/tags)。安装指定版本时使用该标签下的加载器；`main` 可能包含尚未发布的改动。更新固定版本需要替换加载器，已安装脚本不会自动跟随 `main`。
 

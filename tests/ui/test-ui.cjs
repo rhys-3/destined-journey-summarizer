@@ -49,6 +49,14 @@ check('默认日常页与六个主导航',ui.state.activeTab==='daily'&&ui.shado
   click('[data-action="language-preset"][data-language="body"][data-value="English"]');await ui.settle();check('正文语言快捷选择自动保存',vars.managed_values.body_language==='English');
   let language=q('[data-action="language-input"][data-language="thinking"]');language.value='Deutsch';language.dispatchEvent(new Event('input',{bubbles:true}));await ui.settle();check('思维链语言支持自定义并自动保存',vars.managed_values.thinking_language==='Deutsch');
   check('语言短宏分别展开',ui.expandManagedMacros('<|正文语言|>|<|思维链语言|>')==='English|Deutsch');
+const structuralMarkers=['正文开始','历史开始','深度900分界','深度2分界','历史结束','正文结束','记忆区','参考区','运行规则区'].map(name=>'<|命定_'+name+'|>');
+const guardedMessages=[{role:'system',content:structuralMarkers.join(' ')+' <|字数|>'}],noticesBefore=window.errors.length;
+check('两个请求阶段均已注册宏处理',(handlers.get('CHAT_COMPLETION_PROMPT_READY')??[]).length>0&&(handlers.get('GENERATE_AFTER_DATA')??[]).length>0);
+for(const handler of handlers.get('CHAT_COMPLETION_PROMPT_READY')??[])await handler({chat:guardedMessages});
+for(const handler of handlers.get('GENERATE_AFTER_DATA')??[])await handler({prompt:guardedMessages});
+check('实际请求回调保留九个中文结构标签',structuralMarkers.every(token=>guardedMessages[0].content.includes(token)));
+check('实际请求回调继续展开设置短宏',guardedMessages[0].content.endsWith(' 1500'));
+check('结构标签不产生未知宏通知',window.errors.length===noticesBefore);
 click('[data-action="field-preset"][data-field="hanzi"][data-value="2500"]');await ui.settle();check('档位自动保存',vars.managed_values.min_hanzi==='2500');
 let input=q('[data-action="field-number"][data-field="hanzi"]');input.focus();input.value='-';input.dispatchEvent(new Event('input',{bubbles:true}));ui.renderActiveContent(true);check('无效输入刷新后保留且不保存',q('[data-field="hanzi"][data-action="field-number"]').value==='-'&&vars.managed_values.min_hanzi==='2500');
 await ui.setNumericField('hanzi','1500');ui.renderActiveContent();

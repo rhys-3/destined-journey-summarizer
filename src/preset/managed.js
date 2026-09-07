@@ -1,3 +1,10 @@
+// These structural markers are consumed by the preset's message processor.
+// They must survive both assistant macro passes until that processor runs.
+const MESSAGE_PROCESSING_MARKERS = new Set([
+  '正文开始', '历史开始', '深度900分界', '深度2分界', '历史结束', '正文结束',
+  '记忆区', '参考区', '运行规则区',
+].map(name => `<|命定_${name}|>`));
+
 // Dependencies use live accessors so asynchronous operations share the current state.
 export function createManaged(ctx) {
   function countOccurrences(content, token) {
@@ -44,14 +51,16 @@ export function createManaged(ctx) {
         toastr.error('检测到短宏递归残留，已阻止其发送。', ctx.BUTTON_NAME);
       }
     }
-    const unknown = expanded.match(ctx.UNKNOWN_DESTINED_MACRO_PATTERN);
-    if (unknown?.length) {
-      expanded = expanded.replace(ctx.UNKNOWN_DESTINED_MACRO_PATTERN, '');
-      if (reportUnknown) {
-        const names = [...new Set(unknown)].join('、');
-        console.error(`[${ctx.SCRIPT_NAME}] 已移除未知命定宏：${names}`);
-        toastr.error(`检测到未知命定宏，已阻止其发送：${names}`, ctx.BUTTON_NAME);
-      }
+    const unknown = new Set();
+    expanded = expanded.replace(ctx.UNKNOWN_DESTINED_MACRO_PATTERN, token => {
+      if (MESSAGE_PROCESSING_MARKERS.has(token)) return token;
+      unknown.add(token);
+      return '';
+    });
+    if (unknown.size && reportUnknown) {
+      const names = [...unknown].join('、');
+      console.error(`[${ctx.SCRIPT_NAME}] 已移除未知命定宏：${names}`);
+      toastr.error(`检测到未知命定宏，已阻止其发送：${names}`, ctx.BUTTON_NAME);
     }
     return expanded;
   }
